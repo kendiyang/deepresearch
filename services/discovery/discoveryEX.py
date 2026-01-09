@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 class DiscoveryService:
     def __init__(
         self,
+        *,
         serper_api_key: Optional[str] = None,
         timeout: int = 15,
         max_retries: int = 3,
@@ -324,14 +325,13 @@ class DorkResult(BaseModel):
         original_count = len(self.dorks)
         
         def is_valid_dork(dork: str) -> bool:
-            if not dork or len(dork) < 15:  # 太短的 dork 必然无效
+            if not dork or len(dork) < 15:
                 return False
-            # 移除 site:, after:, filetype:, -过滤符后，必须还有关键词
             remaining = re.sub(r'site:[^\s]+', '', dork)
             remaining = re.sub(r'after:[^\s]+', '', remaining)
             remaining = re.sub(r'filetype:[^\s]+', '', remaining)
             remaining = re.sub(r'-\w+', '', remaining).strip()
-            if len(remaining) < 5:  # 关键词部分至少 5 个字符
+            if len(remaining) < 5:
                 logger.warning(f"过滤无效dork（缺少关键词）: {dork}")
                 return False
             return True
@@ -350,9 +350,9 @@ class DiscoveryItem(BaseModel):
     title: Optional[str] = None
 
 class EnterpriseDorkGenerator:
-    def __init__(self,base_url: Optional[str] = None, api_key: Optional[str] = None):
-        base_url = base_url or os.getenv("BASE_URL", "https://chrisapivip.com/v1")
-        api_key = api_key or os.getenv("OPENAI_API_KEY") 
+    def __init__(self):
+        base_url = os.getenv("BASE_URL", "https://chrisapivip.com/v1")
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY 未配置，请在 .env 或环境变量中设置")
     
@@ -614,7 +614,7 @@ class EnterpriseDorkGenerator:
           * site:trustpilot.com (reviews)
           * site:medium.com (influencer insights)
           * Trends: recent trends (google.com/trends,trends.pinterest.com)
-        Generated Dorks (example - should generate 10-25 with this pattern):
+        Generated Dorks (example - should generate 15-20 with this pattern):
           1. site:reddit.com clean beauty (trends OR viral OR 2025) -coupon -buy
           2. site:tiktok.com skincare (overrated OR controversy OR future) after:{one_year_ago_str}
           3. site:voguebusiness.com clean beauty marketing 2025
@@ -759,11 +759,11 @@ class EnterpriseDorkGenerator:
         Keywords: {strategy.primary_keywords_en}
         Time Start: {strategy.time_window_start}
         
-        Task: Generate exactly 10-25 Google Dorks with DIVERSIFIED SOURCES.
+        Task: Generate exactly 10-12 Google Dorks with DIVERSIFIED SOURCES.
         
         ⚠️ CRITICAL: Each dork MUST contain:
         1. site: directive (e.g., site:reddit.com)
-        2. Actual search keywords (at least 3-5 words)
+        2. Actual search keywords (at least 2-3 words)
         3. Optional: time filter (after:), noise filters (-coupon)
         
         INVALID example: "site:instagram.com" (missing keywords)
@@ -805,7 +805,7 @@ class EnterpriseDorkGenerator:
            - Bad: `site:reddit.com "very specific long phrase about skincare marketing trends"`
            - Good: `site:reddit.com skincare (trends OR viral OR forecast) after:{strategy.time_window_start}`
         
-        Output exactly 10-25 dorks, ensuring they span different sources and perspectives.
+        Output exactly 10-12 dorks, ensuring they span different sources and perspectives.
         
         ⚠️ MANDATORY CHECKS BEFORE OUTPUT:
         1. Each dork length ≤120 characters
