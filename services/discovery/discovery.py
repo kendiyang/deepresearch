@@ -6,8 +6,9 @@ import random
 import asyncio
 import datetime
 import warnings
-from typing import List, Literal, Optional, Dict
+from typing import List, Literal, Optional, Dict, Set
 from urllib.parse import urlparse
+from dataclasses import dataclass
 
 # 抑制 langchain 在 Python 3.14 上的 Pydantic V1 警告
 warnings.filterwarnings(
@@ -36,6 +37,191 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class QualityMetrics:
+    """内容质量指标"""
+    karma: Optional[int] = None  # Reddit 用户 Karma
+    likes: Optional[int] = None  # TikTok/社交媒体点赞数
+    comments: Optional[int] = None  # 评论数
+    shares: Optional[int] = None  # 分享数
+    verified: bool = False  # 是否认证用户
+    spam_score: float = 0.0  # 垃圾内容评分 (0-1, 越高越可疑)
+    
+    def is_high_quality(self, platform: str) -> bool:
+        """根据平台判断是否为高质量内容"""
+        # Reddit: Karma > 100
+        if "reddit.com" in platform:
+            return self.karma is not None and self.karma > 100
+        # TikTok: 评论数 >= 100
+        if "tiktok.com" in platform:
+            return self.comments is not None and self.comments >= 100
+        # 其他平台：spam_score < 0.5
+        return self.spam_score < 0.5
+
+
+class SpamFilter:
+    """强力垃圾内容过滤器"""
+    
+    # 垃圾关键词特征（多语言）
+    SPAM_KEYWORDS = {
+        # 促销类
+        "buy now", "click here", "limited offer", "discount code", "coupon",
+        "promo code", "sale", "% off", "free shipping", "order now",
+        "立即购买", "限时优惠", "优惠码", "折扣", "促销", "包邮",
+        # SEO 垃圾
+        "click this link", "check out my", "follow me", "subscribe",
+        "关注我", "订阅", "点击链接",
+        # 可疑模式
+        "100% guaranteed", "make money fast", "work from home",
+        "赚钱", "兼职", "在家工作",
+    }
+    
+    # 可疑域名后缀
+    SUSPICIOUS_DOMAINS = {
+        ".xyz", ".top", ".click", ".link", ".shop", ".store",
+        ".bid", ".win", ".download", ".loan", ".review",
+        ".date", ".racing", ".accountant", ".science", ".faith",  # 新增常见垃圾后缀
+    }
+    
+    # 可疑域名模式
+    SUSPICIOUS_PATTERNS = [
+        "free-", "get-", "buy-", "-now", "-offer", "-deal",  # 促销模式
+        "2024", "2025", "2026",  # 年份（垃圾站常用）
+        "amazing", "best-", "cheap-",  # 夸张词汇
+    ]
+    
+    @classmethod
+    def calculate_spam_score(cls, text: Optional[str], url: str, title: Optional[str] = None) -> float:
+        """计算垃圾内容评分 (0-1, 越高越可疑)
+        
+        评分维度：
+        - 关键词匹配度 (50%)
+        - URL 可疑度 (30%)
+        - 标题可疑度 (15%)
+        - 格式异常 (5%)
+        """
+        score = 0.0
+        
+        # 1. 关键词检测 (50% - 提高权重)
+        combined_text = f"{text or ''} {title or ''}".lower()
+        keyword_hits = sum(1 for kw in cls.SPAM_KEYWORDS if kw in combined_text)
+        if keyword_hits > 0:
+            score += min(keyword_hits * 0.15, 0.5)  # 每个关键词 +0.15，最高 0.5
+        
+        # 2. URL 域名检测 (30%)
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            # 可疑域名后缀
+            if any(domain.endswith(suffix) for suffix in cls.SUSPICIOUS_DOMAINS):
+                score += 0.35  # 可疑后缀
+            # 可疑域名模式
+            if any(pattern in domain for pattern in cls.SUSPICIOUS_PATTERNS):
+                score += 0.20  # 可疑模式
+            # 过多数字/连字符
+            if domain.count("-") > 3 or sum(c.isdigit() for c in domain) > 5:
+                score += 0.15
+        except:
+            score += 0.1
+        
+        # 3. 标题可疑模式 (15%)
+        if title:
+            title_lower = title.lower()
+            # 全大写（超过 50% 字符）
+            if sum(1 for c in title if c.isupper()) > len(title) * 0.5:
+                score += 0.15  # 提高到 0.15
+            # 过多表情符号
+            emoji_count = sum(1 for c in title if ord(c) > 0x1F300)
+            if emoji_count > 5:
+                score += 0.15  # 提高到 0.15
+        
+        # 4. 格式异常 (5%)
+        if text:
+            # 过短或过长
+            if len(text) < 20 or len(text) > 10000:
+                score += 0.03
+            # 重复内容（简单检测：同一词出现 > 10 次）
+            words = text.split()
+            if words and max(words.count(w) for w in set(words)) > 10:
+                score += 0.02
+        
+        return min(score, 1.0)  # 限制在 [0, 1]
+    
+    @classmethod
+    def is_spam(cls, text: Optional[str], url: str, title: Optional[str] = None, threshold: float = 0.5) -> bool:
+        """判断是否为垃圾内容"""
+        score = cls.calculate_spam_score(text, url, title)
+        return score >= threshold
+
+
+class ContentQualityFilter:
+    """内容质量过滤器 - 高信源白名单机制"""
+    
+    @staticmethod
+    async def extract_quality_metrics(url: str, title: Optional[str], client: httpx.AsyncClient) -> QualityMetrics:
+        """从 URL 提取质量指标（支持多平台）
+        
+        注意：这是简化版实现，实际生产环境需要：
+        1. Reddit: 调用 Reddit API 获取 author karma
+        2. TikTok: 调用 TikTok API 获取点赞数
+        3. 其他平台：使用爬虫或 API 获取互动数据
+        
+        当前实现：基于 URL 模式和标题启发式推断
+        """
+        metrics = QualityMetrics()
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # Reddit: 尝试推断（实际应调用 API）
+        if "reddit.com" in domain:
+            # 简化：假设 /comments/ 的帖子都是高 karma（> 100）
+            # 生产环境：应解析 URL 获取 post_id，调用 Reddit API
+            if "/comments/" in parsed.path:
+                metrics.karma = 150  # 默认假设高质量
+            else:
+                metrics.karma = 50  # 默认假设低质量
+        
+        # TikTok: 尝试推断（实际应调用 API）
+        elif "tiktok.com" in domain:
+            # 简化：假设能搜到的视频都有一定评论数
+            # 生产环境：应解析 video_id，调用 TikTok API
+            if "/video/" in parsed.path:
+                metrics.comments = 150  # 默认假设有足够评论（>= 100 为高质量）
+        
+        # 通用垃圾评分
+        metrics.spam_score = SpamFilter.calculate_spam_score(
+            text=None,  # 当前没有抓取正文
+            url=url,
+            title=title
+        )
+        
+        return metrics
+    
+    @staticmethod
+    def filter_by_quality(items: List["DiscoveryItem"]) -> List["DiscoveryItem"]:
+        """根据质量指标过滤项目"""
+        filtered = []
+        for item in items:
+            if not item.quality_metrics:
+                # 没有质量数据，保守放行
+                filtered.append(item)
+                continue
+            
+            # 高信源白名单检查
+            if not item.quality_metrics.is_high_quality(item.domain):
+                logger.debug(f"过滤低质量内容: {item.url} (karma={item.quality_metrics.karma}, likes={item.quality_metrics.likes}, comments={item.quality_metrics.comments})")
+                continue
+            
+            # 垃圾内容检查
+            if item.quality_metrics.spam_score >= 0.5:
+                logger.warning(f"过滤垃圾内容: {item.url} (spam_score={item.quality_metrics.spam_score:.2f})")
+                continue
+            
+            filtered.append(item)
+        
+        return filtered
+
+
 class DiscoveryService:
     def __init__(
         self,
@@ -48,6 +234,8 @@ class DiscoveryService:
         enable_cache: bool = True,
         cache_type: Optional[str] = None,
         cache_ttl: int = 86400,
+        enable_quality_filter: bool = True,  # 启用高信源白名单
+        spam_threshold: float = 0.5,  # 垃圾内容阈值
     ):
         # 生产环境从 .env / 环境变量读取，不再提供默认密钥
         self.serper_api_key = serper_api_key or os.getenv("SERPER_API_KEY")
@@ -83,6 +271,12 @@ class DiscoveryService:
             except Exception as e:
                 logger.warning("缓存初始化失败，将直接调用 API: %s", e)
                 self.enable_cache = False
+        
+        # 质量过滤配置
+        self.enable_quality_filter = enable_quality_filter
+        self.spam_threshold = spam_threshold
+        if enable_quality_filter:
+            logger.info("内容质量过滤已启用: 高信源白名单 + 垃圾过滤 (阈值=%.2f)", spam_threshold)
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -149,6 +343,39 @@ class DiscoveryService:
 
         logger.info("汇总后有效链接: %d", len(results_map))
         
+        all_items = list(results_map.values())
+        
+        # 质量过滤：提取质量指标 + 高信源白名单过滤
+        if self.enable_quality_filter:
+            logger.info("开始质量过滤: 提取质量指标...")
+            # 并发提取质量指标
+            quality_tasks = [
+                ContentQualityFilter.extract_quality_metrics(
+                    url=item.url,
+                    title=item.title,
+                    client=self.client
+                )
+                for item in all_items
+            ]
+            quality_metrics_list = await asyncio.gather(*quality_tasks, return_exceptions=True)
+            
+            # 附加质量指标到 item
+            for item, metrics in zip(all_items, quality_metrics_list):
+                if isinstance(metrics, Exception):
+                    logger.warning(f"质量指标提取失败: {item.url} | {metrics}")
+                    item.quality_metrics = QualityMetrics(spam_score=0.0)  # 默认通过
+                else:
+                    item.quality_metrics = metrics
+            
+            # 应用高信源白名单 + 垃圾过滤
+            before_count = len(all_items)
+            all_items = ContentQualityFilter.filter_by_quality(all_items)
+            after_count = len(all_items)
+            logger.info(
+                "质量过滤完成: %d → %d (过滤掉 %d 个低质量/垃圾内容)",
+                before_count, after_count, before_count - after_count
+            )
+        
         # 输出缓存统计
         if self.enable_cache:
             stats = self.metrics.get_stats()
@@ -159,7 +386,7 @@ class DiscoveryService:
                 stats["cost_saved_usd"],
             )
         
-        return list(results_map.values())
+        return all_items
 
     async def _throttle(self) -> None:
         # 简单的全局节流，确保请求间隔不低于 min_interval
@@ -348,6 +575,7 @@ class DiscoveryItem(BaseModel):
     dork: str
     rank: int
     title: Optional[str] = None
+    quality_metrics: Optional[QualityMetrics] = None  # 质量指标
 
 class EnterpriseDorkGenerator:
     def __init__(self,base_url: Optional[str] = None, api_key: Optional[str] = None):
@@ -446,7 +674,6 @@ class EnterpriseDorkGenerator:
                 "social_media": [
                     "site:reddit.com",           # 不限定特定板块，而是全Reddit
                     "site:tiktok.com",
-                    "site:instagram.com",
                     "site:youtube.com",
                 ],
                 "commerce": [
@@ -751,6 +978,34 @@ class EnterpriseDorkGenerator:
         platforms_by_type = []
         for source_type, sites in domain_sources.items():
             platforms_by_type.extend(sites)
+
+        include_reddit_tagging = any(
+            "reddit.com" in site for sites in domain_sources.values() for site in sites
+        )
+
+        reddit_tagging_block = ""
+        if include_reddit_tagging:
+            reddit_tagging_block = f"""
+        Reddit Comment Tagging System (optimize intent coverage):
+        1) Intent Tags (most valuable): Recommendation, Comparison, Troubleshooting, Alternatives
+        2) Sentiment/Feedback (prioritize NEGATIVE - higher value):
+           - Negative: Complaint, Disappointment, Regret, "not worth it", "waste of money", Rant
+           - Critical: Frustration, Sarcasm, Criticism, "overrated", "overhyped"
+           - Positive: Fan/Evangelist, Constructive
+        3) Identity/Credibility: Expert/Verified, Power User (high Karma), Beginner
+        4) Native Reddit Metadata: Sticky, Controversial, Flair (Discussion/Help/Review)
+        5) Content Features: High-Engagement (deep threads), External Links
+
+        ⚠️ CRITICAL: Negative comments are HIGH VALUE - they reveal pain points, deal-breakers, and unmet needs.
+        Ensure at least 1-2 dorks target negative sentiment explicitly.
+
+        When crafting reddit dorks, combine site:reddit.com with keywords hinting at these tags, e.g.:
+        - Negative sentiment: site:reddit.com skincare (disappointed OR regret OR "not worth it" OR waste)
+        - Critical/rant: site:reddit.com skincare (overrated OR overhyped OR rant OR complaint)
+        - Troubleshooting: site:reddit.com troubleshooting issue error fail "need help"
+        - Comparison: site:reddit.com skincare recommendation OR alternatives OR comparison
+        - Controversial: site:reddit.com controversial topic flair:"discussion" after:{strategy.time_window_start}
+        """
         
         dork_parser = PydanticOutputParser(pydantic_object=DorkResult)
         dork_prompt = f"""
@@ -780,6 +1035,7 @@ class EnterpriseDorkGenerator:
         ✅ Keep it concise: site: + keywords + operators + time filter
         ✅ Example good length: "site:reddit.com skincare (trends OR viral) -coupon after:{strategy.time_window_start}" (varies by date)
         ❌ Example too long: Over 120 chars will be truncated by search engine!
+        {reddit_tagging_block}
         
         Available Diversified Sources (pick from these):
         {json.dumps(domain_sources, indent=2)}
@@ -828,7 +1084,7 @@ if __name__ == "__main__":
         
         # 使用异步上下文管理器
         async with DiscoveryService() as discovery:
-            test_topic = "北美市场护肤品营销趋势分析"
+            test_topic = "阿曼绿乳香精油 —— 黄金级淡纹紧致修复力、抗皱力。比普通的眼部精华油增加了皇家顶级的珍稀抗皱精油配方"
             dork_result = generator.run(test_topic)
             print(f"\n生成的 Dorks:")
             for i, dork in enumerate(dork_result.dorks, 1):
