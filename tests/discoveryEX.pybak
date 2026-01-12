@@ -51,7 +51,7 @@ class DiscoveryService:
         cache_ttl: int = 86400,
     ):
         # 生产环境从 .env / 环境变量读取，不再提供默认密钥
-        self.serper_api_key = serper_api_key or os.getenv("SERPER_API_KEY")
+        self.serper_api_key = serper_api_key or os.getenv("SERPER_API_KEY" , "3286197ccfe6328c1fb98a15da9d2e4f4e5e3465")
         self.base_url = "https://google.serper.dev/search"
         self.timeout = timeout
         self.max_retries = max_retries
@@ -352,7 +352,7 @@ class DiscoveryItem(BaseModel):
 class EnterpriseDorkGenerator:
     def __init__(self):
         base_url = os.getenv("BASE_URL", "https://chrisapivip.com/v1")
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+        api_key = os.getenv("OPENAI_API_KEY" , "sk-wvbHvCfLHCvCf0kHEB8xTOInLVfZtDe4rNB0FiHQxgbQ0OhY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY 未配置，请在 .env 或环境变量中设置")
     

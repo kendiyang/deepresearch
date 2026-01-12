@@ -32,7 +32,7 @@ from services.knowledge.storageAndRetrieval import (
     MetadataKeys,
     TABLE_NAME,
 )
-from modules.unifiedComment import UnifiedComment
+from modules.formatter import UnifiedComment
 from langchain_core.embeddings import Embeddings
 from sqlalchemy import text, create_engine
 import numpy as np

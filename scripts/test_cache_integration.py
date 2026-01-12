@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from services.discovery.discovery import DiscoveryService, DorkResult
-from services.discovery.cache import SearchCache, CacheMetrics
+from services.search.cache import SearchCache, CacheMetrics
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)

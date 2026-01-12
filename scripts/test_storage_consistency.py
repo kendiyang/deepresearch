@@ -20,7 +20,7 @@ from services.knowledge.storageAndRetrieval import (
     COLLECTION_NAME,
     TABLE_NAME
 )
-from modules.unifiedComment import UnifiedComment
+from modules.formatter import UnifiedComment
 
 def test_metadata_keys_consistency():
     """测试 metadata 键名的一致性"""

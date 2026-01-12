@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 sys.path.append(os.path.abspath('.'))
 
 from services.processing.dataCleab import DataRefinery
-from modules.unifiedComment import UnifiedComment
+from modules.formatter import UnifiedComment
 
 
 class DataRefineryIntegrationTest(unittest.TestCase):

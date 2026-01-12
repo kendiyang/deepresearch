@@ -1,9 +1,9 @@
-from typing import TypedDict, List, Annotated
-import operator
+from typing import TypedDict, List
 
 class ResearchState(TypedDict):
     task_id: str
-    original_query: str
+    topic: str
+    intent_topics: List[str]            # 与用户意图相关的主题列表
     current_hypothesis: str             # 当前的假设（如：用户不是讨厌产品，是讨厌设置过程）
     search_queries: List[str]           # 下一步要搜什么
     gathered_data: List[str]            # 原始数据摘要

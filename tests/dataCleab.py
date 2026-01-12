@@ -1,7 +1,7 @@
 import re
 import emoji
 from bs4 import BeautifulSoup
-from modules.unifiedComment import UnifiedComment
+from modules.formatter import UnifiedComment
 from typing import Dict
 from datetime import datetime
 

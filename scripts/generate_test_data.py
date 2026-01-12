@@ -8,7 +8,7 @@ sys.path.append(os.path.abspath('.'))
 
 from datetime import datetime, timezone, timedelta
 from services.knowledge.storageAndRetrieval import BaseStorage
-from modules.unifiedComment import UnifiedComment
+from modules.formatter import UnifiedComment
 from langchain_core.embeddings import Embeddings
 import numpy as np
 from typing import List
