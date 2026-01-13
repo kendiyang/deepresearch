@@ -8,10 +8,11 @@ import signal
 import uuid
 import mimetypes
 import hashlib
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Literal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, urlunparse
 
 # --- 第三方库 ---
 import aiofiles
@@ -46,13 +47,13 @@ class AppConfig(BaseSettings):
     S3_BUCKET_NAME: str = "crawler-data"
     S3_REGION_NAME: str = "us-east-1"
     S3_BATCH_SIZE: int = 50
-    S3_FLUSH_INTERVAL: int = 30
     
     # 爬虫行为
-    MAX_CONCURRENCY: int = 10      # 建议先从3开始测试，稳定后再加
+    MAX_CONCURRENCY: int = 5
     MAX_RETRIES: int = 3
-    REQUEST_TIMEOUT: int = 45     # 增加超时时间以适应慢速代理
-    PROXY_LIST: List[str] = []    # 格式: ["http://user:pass@ip:port"]
+    REQUEST_TIMEOUT: int = 60      
+    # 代理列表 (示例) - 如果没有有效代理，建议设为空列表 []
+    PROXY_LIST: List[str] = ["http://127.0.0.1:1080"]      
 
     model_config = SettingsConfigDict(
         env_prefix="CRAWLER_",
@@ -79,7 +80,105 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(JsonFormatter())
 logger.addHandler(handler)
 
-# ================= 2. 存储抽象层 (Storage Layer) =================
+# ================= 2. 平台专用处理器 (Reddit & TikTok) =================
+
+class RedditHandler:
+    @staticmethod
+    def convert_to_api_url(url: str) -> str:
+        """
+        将普通 Reddit URL 转换为 JSON API URL
+        确保 .json 添加在路径末尾，且不破坏 Query 参数
+        """
+        parsed = urlparse(url)
+        if parsed.path.endswith(".json"):
+            return url
+        
+        # 去除尾部斜杠
+        clean_path = parsed.path.rstrip("/")
+        # 添加 .json
+        new_path = f"{clean_path}.json"
+        
+        # 重组 URL
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            new_path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+
+    @staticmethod
+    def parse_response(data: Dict, original_url: str) -> Dict:
+        """解析 Reddit JSON 响应"""
+        try:
+            content_type = "reddit_listing"
+            extracted_data = {}
+
+            # 情况 A: 详情页 (返回列表: [Post, Comments])
+            if isinstance(data, list) and len(data) > 0:
+                content_type = "reddit_post_detail"
+                post_data = data[0].get('data', {}).get('children', [{}])[0].get('data', {})
+                comments_data = data[1].get('data', {}).get('children', []) if len(data) > 1 else []
+                
+                extracted_data = {
+                    "title": post_data.get("title"),
+                    "selftext": post_data.get("selftext"),
+                    "author": post_data.get("author"),
+                    "ups": post_data.get("ups"),
+                    "upvote_ratio": post_data.get("upvote_ratio"),
+                    "comment_count": post_data.get("num_comments"),
+                    "created_utc": post_data.get("created_utc"),
+                    "top_comments": [c['data'].get('body') for c in comments_data[:3] if 'body' in c.get('data', {})]
+                }
+            
+            # 情况 B: 列表页 (Subreddit Listing)
+            elif isinstance(data, dict):
+                children = data.get("data", {}).get("children", [])
+                extracted_data = {
+                    "post_count": len(children),
+                    "posts": [
+                        {
+                            "title": c['data'].get('title'),
+                            "url": c['data'].get('url')
+                        } 
+                        for c in children[:5]
+                    ]
+                }
+
+            return {
+                "url": original_url,
+                "platform": "reddit",
+                "type": content_type,
+                "parsed": extracted_data,
+                "raw_json": data, 
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {"url": original_url, "error": str(e), "raw_partial": str(data)[:200]}
+
+class TikTokHandler:
+    @staticmethod
+    def extract_data(html: str, url: str) -> Optional[Dict]:
+        pattern = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">([^<]+)</script>', html)
+        if not pattern:
+            pattern = re.search(r'<script id="SIGI_STATE" type="application/json">([^<]+)</script>', html)
+        
+        if pattern:
+            try:
+                raw_data = json.loads(pattern.group(1))
+                return {
+                    "url": url,
+                    "platform": "tiktok",
+                    "type": "video_meta",
+                    "raw_data": raw_data,
+                    "timestamp": datetime.now().isoformat()
+                }
+            except:
+                pass
+        return None
+
+# ================= 3. 存储抽象层 (Storage Layer) =================
 
 class StorageBackend(ABC):
     @abstractmethod
@@ -100,7 +199,6 @@ class LocalStorage(StorageBackend):
 
     async def initialize(self):
         os.makedirs(self.downloads_dir, exist_ok=True)
-        # 使用 append 模式，且 buffering=1 确保尽快写入
         self._file_handle = await aiofiles.open(self.data_file, mode='a', encoding='utf-8', buffering=1)
         logger.info(f"💾 Local Storage initialized at {self.base_dir}")
 
@@ -113,23 +211,18 @@ class LocalStorage(StorageBackend):
     async def save_data(self, record: Dict):
         if self._file_handle:
             await self._file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            # 强制刷新缓冲区，防止程序意外退出数据丢失
             await self._file_handle.flush()
 
     async def close(self):
         if self._file_handle:
             await self._file_handle.close()
-            logger.info("💾 Local Storage closed")
 
 class S3Storage(StorageBackend):
-    # (S3代码保持不变，为节省篇幅略去，逻辑同上)
     def __init__(self):
         self.session = get_session()
         self.client = None
         self.bucket = CONFIG.S3_BUCKET_NAME
         self.buffer = []
-        self._bg_task = None
-        self._running = False
 
     async def initialize(self):
         self.client = await self.session.create_client(
@@ -138,7 +231,6 @@ class S3Storage(StorageBackend):
             aws_secret_access_key=CONFIG.S3_SECRET_KEY,
             region_name=CONFIG.S3_REGION_NAME
         ).__aenter__()
-        self._running = True
         logger.info("☁️ S3 Storage initialized")
 
     async def save_asset(self, content: bytes, filename: str, content_type: str) -> str:
@@ -163,7 +255,7 @@ class S3Storage(StorageBackend):
         await self._flush()
         if self.client: await self.client.__aexit__(None, None, None)
 
-# ================= 3. 数据持久层 (DB - 任务队列) =================
+# ================= 4. 数据持久层 (DB) =================
 class TaskManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -172,7 +264,7 @@ class TaskManager:
 
     async def init_db(self):
         self._db = await aiosqlite.connect(self.db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL;")  # 关键：开启 WAL 模式以支持并发读写
+        await self._db.execute("PRAGMA journal_mode=WAL;")
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 url TEXT PRIMARY KEY,
@@ -183,10 +275,8 @@ class TaskManager:
         """)
         await self._db.commit()
 
-
     async def add_tasks(self, urls: List[str]):
         if not urls: return
-        # 使用 INSERT OR IGNORE 避免重复添加
         async with self._lock:
             await self._db.executemany(
                 "INSERT OR IGNORE INTO tasks (url) VALUES (?)", [(u,) for u in urls]
@@ -194,11 +284,7 @@ class TaskManager:
             await self._db.commit()
 
     async def acquire_task(self) -> Optional[Tuple[str, int]]:
-        """
-        核心修复：
-        1. 使用 RETURNING 子句原子性获取并更新任务
-        2. 确保 commit 在 cursor 上下文之外
-        """
+        # 获取待处理任务 (PENDING 或 失败次数未超限的 FAILED)
         q = f"""
             UPDATE tasks
             SET status = 'PROCESSING', updated_at = CURRENT_TIMESTAMP
@@ -210,114 +296,168 @@ class TaskManager:
             )
             RETURNING url, retry_count
         """
-
         async with self._lock:
             try:
-                row = None
                 async with self._db.execute(q, (CONFIG.MAX_RETRIES,)) as cursor:
                     row = await cursor.fetchone()
-
                 if row:
                     await self._db.commit()
                     return row
-
                 return None
-
             except Exception as e:
                 logger.error(f"DB Acquire Error: {e}")
                 return None
 
-    async def update_task(self, url: str, status: str):
-        try:
-            async with self._lock:
-                if status == 'FAILED':
-                    await self._db.execute("UPDATE tasks SET status=?, retry_count=retry_count+1 WHERE url=?", (status, url))
+    async def update_task(self, url: str, status: str, fatal_error: bool = False):
+        async with self._lock:
+            if status == 'FAILED':
+                if fatal_error:
+                    # 如果是致命错误 (如 404)，直接将重试次数设为最大，防止再次提取
+                    await self._db.execute(
+                        "UPDATE tasks SET status=?, retry_count=999 WHERE url=?", 
+                        (status, url)
+                    )
                 else:
-                    await self._db.execute("UPDATE tasks SET status=? WHERE url=?", (status, url))
-                await self._db.commit()
-        except Exception as e:
-            logger.error(f"DB Update Error for {url}: {e}")
+                    await self._db.execute(
+                        "UPDATE tasks SET status=?, retry_count=retry_count+1 WHERE url=?", 
+                        (status, url)
+                    )
+            else:
+                await self._db.execute("UPDATE tasks SET status=? WHERE url=?", (status, url))
+            await self._db.commit()
 
     async def close(self):
         if self._db: await self._db.close()
 
-# ================= 4. 网络与解析层 (核心修复) =================
+# ================= 5. 网络与解析层 (关键修改版) =================
 class NetworkEngine:
     def __init__(self, storage: StorageBackend):
         self.storage = storage
-        self.impersonates = ["chrome120", "safari17_0", "edge101"]
+        # 移除 safari，优先使用 chrome 系列以获得更好的 API 兼容性
+        self.impersonates = ["chrome120", "chrome124"]
 
-    async def fetch_and_process(self, url: str) -> bool:
+    def _is_reddit_url(self, url: str) -> bool:
+        return "reddit.com" in url
+
+    def _is_tiktok_url(self, url: str) -> bool:
+        return "tiktok.com" in url
+
+    async def fetch_and_process(self, url: str) -> Literal["SUCCESS", "RETRY", "FATAL"]:
+        """
+        返回状态码:
+        SUCCESS: 成功
+        RETRY: 软错误 (超时, 5xx)
+        FATAL: 硬错误 (404, 权限拒绝) -> 不再重试
+        """
         proxy = random.choice(CONFIG.PROXY_LIST) if CONFIG.PROXY_LIST else None
-        
-        try:
-            # 1. 随机延迟
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            
-            # 2. 创建 Session (关键修复：移除 asyncio.wait_for)
-            # curl_cffi 的 timeout 参数已经足够，外部 wait_for 容易引起 C 层死锁
-            # 明确传递 proxies：当没有配置代理时传空 dict，避免 libcurl 从环境变量读取无效代理
-            proxies = {"http": proxy, "https": proxy} if proxy else {}
+        proxies = {"http": proxy, "https": proxy} if proxy else {}
 
+        target_url = url
+        
+        # ⚠️ 关键修改 1: 不要手动设置 User-Agent，让 impersonate 自动处理
+        # 仅设置语言偏好，这不会破坏 TLS 指纹
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        }
+        
+        if self._is_reddit_url(url):
+            target_url = RedditHandler.convert_to_api_url(url)
+            # Reddit API 对 Content-Type 有时敏感
+            headers["Accept"] = "*/*"
+
+        try:
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+
+            # ⚠️ 关键修改 2: impersonate 自动处理指纹
             async with AsyncSession(
                 impersonate=random.choice(self.impersonates),
                 proxies=proxies,
+                headers=headers,
                 timeout=CONFIG.REQUEST_TIMEOUT
             ) as s:
                 
-                logger.debug(f"🔍 Requesting: {url}")
-                response = await s.get(url)
+                logger.debug(f"🔍 Requesting: {target_url}")
+                response = await s.get(target_url)
                 
-                # 3. 状态码判断
+                # --- 404 处理 (Reddit 专用) ---
+                if response.status_code == 404:
+                    logger.warning(f"⛔️ Resource Not Found (404): {target_url}")
+                    return "FATAL" # 致命错误，不重试
+
+                # --- 权限/速率限制处理 ---
+                if response.status_code in [403, 429]:
+                    logger.warning(f"⚠️ Access Denied/Rate Limit ({response.status_code}): {url}")
+                    return "RETRY"
+
                 if response.status_code != 200:
                     logger.warning(f"⚠️ HTTP {response.status_code} - {url}")
-                    return False
+                    return "RETRY"
                 
-                # 4. 内容处理
+                # --- 成功响应处理 ---
+                
+                # 1. Reddit JSON
+                if self._is_reddit_url(url):
+                    try:
+                        json_data = response.json()
+                        parsed = RedditHandler.parse_response(json_data, url)
+                        await self.storage.save_data(parsed)
+                        logger.info(f"✅ Saved Reddit JSON: {url}")
+                        return "SUCCESS"
+                    except json.JSONDecodeError:
+                        logger.error(f"❌ Reddit returned non-JSON content for: {target_url}")
+                        # 如果 API 返回了 HTML (通常是 Cloudflare 盾)，则重试
+                        return "RETRY"
+
                 content_type = response.headers.get("content-type", "").lower()
                 
+                # 2. TikTok Meta
+                if self._is_tiktok_url(url) and "text/html" in content_type:
+                    tiktok_data = TikTokHandler.extract_data(response.text, url)
+                    if tiktok_data:
+                        await self.storage.save_data(tiktok_data)
+                        logger.info(f"✅ Saved TikTok Meta: {url}")
+                        return "SUCCESS"
+                
+                # 3. 通用 HTML
                 if "text/html" in content_type:
                     data = self._parse_html(response.text, url)
                     await self.storage.save_data(data)
                     logger.info(f"✅ Saved HTML: {url}")
+                
+                # 4. 通用文件下载
                 else:
                     filename = self._get_filename(url, content_type)
                     path = await self.storage.save_asset(response.content, filename, content_type)
                     meta = {
-                        "url": url,
-                        "type": "asset",
-                        "path": path,
-                        "size": len(response.content),
-                        "ts": datetime.now().isoformat()
+                        "url": url, "type": "asset", "path": path,
+                        "size": len(response.content), "ts": datetime.now().isoformat()
                     }
                     await self.storage.save_data(meta)
                     logger.info(f"✅ Saved Asset: {filename}")
                 
-                return True
+                return "SUCCESS"
 
         except RequestsError as e:
             logger.error(f"❌ Network Error {url}: {e}")
-            return False
+            return "RETRY"
         except Exception as e:
             logger.error(f"❌ System Error {url}: {e}")
-            return False
+            return "RETRY"
 
     def _parse_html(self, html: str, url: str) -> Dict:
         soup = BeautifulSoup(html, "html.parser")
         content = ""
-        # 优先使用 Trafilatura，否则降级到 BS4
         if HAS_TRAFILATURA:
             try:
                 content = trafilatura.extract(html, include_comments=False)
             except: pass
             
         if not content:
-            # 简单降级处理
             paras = [p.get_text().strip() for p in soup.find_all("p")]
             content = "\n".join([p for p in paras if len(p) > 20])
 
         title = soup.title.string.strip() if soup.title else "No Title"
-        
         return {
             "url": url,
             "type": "html",
@@ -336,7 +476,7 @@ class NetworkEngine:
             name = f"{hash_name}{ext}"
         return name
 
-# ================= 5. 主编排 (Orchestrator) =================
+# ================= 6. 主编排 (Orchestrator) =================
 class CrawlerEngine:
     def __init__(self):
         if CONFIG.STORAGE_TYPE == "s3":
@@ -352,25 +492,24 @@ class CrawlerEngine:
         logger.info(f"👷 Worker-{worker_id} ready")
         while not self.shutdown_event.is_set():
             try:
-                # 获取任务
                 task = await self.db.acquire_task()
-                
                 if not task:
-                    # 队列空时稍微休息，避免死循环消耗CPU
                     await asyncio.sleep(2)
                     continue
                 
                 url, retry_cnt = task
                 logger.info(f"▶️ Worker-{worker_id} processing: {url} (Retry: {retry_cnt})")
                 
-                # 执行下载
-                success = await self.network.fetch_and_process(url)
+                # 获取执行结果状态
+                status = await self.network.fetch_and_process(url)
                 
-                # 更新状态
-                if success:
+                if status == "SUCCESS":
                     await self.db.update_task(url, "COMPLETED")
-                else:
-                    await self.db.update_task(url, "FAILED")
+                elif status == "FATAL":
+                    logger.error(f"💀 Worker-{worker_id} marking FATAL error for: {url}")
+                    await self.db.update_task(url, "FAILED", fatal_error=True)
+                else: # RETRY
+                    await self.db.update_task(url, "FAILED", fatal_error=False)
                     
             except asyncio.CancelledError:
                 break
@@ -379,15 +518,11 @@ class CrawlerEngine:
                 await asyncio.sleep(1)
 
     async def run(self, seeds: List[str]):
-        # 初始化目录
         os.makedirs(CONFIG.DATA_DIR, exist_ok=True)
-        
-        # 初始化组件
         await self.db.init_db()
         await self.db.add_tasks(seeds)
         await self.storage.initialize()
         
-        # 信号处理 (Windows 下忽略)
         loop = asyncio.get_running_loop()
         if sys.platform != "win32":
             try:
@@ -398,15 +533,11 @@ class CrawlerEngine:
 
         logger.info(f"🚀 Engine Started | Storage: {CONFIG.STORAGE_TYPE} | Workers: {CONFIG.MAX_CONCURRENCY}")
         
-        # 启动 Workers
         workers = [asyncio.create_task(self.worker(i)) for i in range(CONFIG.MAX_CONCURRENCY)]
         
         try:
-            # 主循环监控
             while not self.shutdown_event.is_set():
-                # 检查所有 worker 是否存活
                 if all(w.done() for w in workers):
-                    logger.info("All workers finished unexpectedly.")
                     break
                 await asyncio.sleep(1)
         except KeyboardInterrupt:
@@ -415,19 +546,23 @@ class CrawlerEngine:
         finally:
             self.shutdown_event.set()
             logger.info("⏳ Shutting down workers...")
-            # 等待所有 Worker 结束
             await asyncio.gather(*workers, return_exceptions=True)
-            
-            # 关闭资源
             await self.db.close()
             await self.storage.close()
             logger.info("👋 Shutdown Complete.")
 
 if __name__ == "__main__":
-    # 种子URL
-    targets = ["https://pubmed.ncbi.nlm.nih.gov/40927190", "https://pubmed.ncbi.nlm.nih.gov/39875757", "https://pubmed.ncbi.nlm.nih.gov/40733062", "https://pubmed.ncbi.nlm.nih.gov/40711084", "https://pubmed.ncbi.nlm.nih.gov/41341032", "https://pubmed.ncbi.nlm.nih.gov/41075523", "https://pubmed.ncbi.nlm.nih.gov/41037121", "https://pubmed.ncbi.nlm.nih.gov/40810753", "https://pubmed.ncbi.nlm.nih.gov/40997946", "https://pubmed.ncbi.nlm.nih.gov/40690118", "https://pubmed.ncbi.nlm.nih.gov/40074996", "https://pubmed.ncbi.nlm.nih.gov/40488034", "https://pubmed.ncbi.nlm.nih.gov/40667507", "https://pmc.ncbi.nlm.nih.gov/articles/PMC12669112", "https://www.researchgate.net/figure/Production-of-frankincense-nutraceuticals-Boswellia-tree-grown-in-Somalia-a_fig1_336222354", "https://www.trustpilot.com/review/vedaoils.com", "https://www.trustpilot.com/review/wholesalebotanics.com", "https://www.trustpilot.com/review/freshskin.co.uk?page=4", "https://www.trustpilot.com/review/www.planttherapy.com", "https://www.trustpilot.com/review/youngliving.com", "https://au.trustpilot.com/review/www.thearomatherapyshop.com", "https://www.trustpilot.com/review/doterra.com?page=2", "https://www.trustpilot.com/review/majesticpure.com", "https://uk.trustpilot.com/review/freshskin.co.uk", "https://www.trustpilot.com/review/www.edensgarden.com", "https://www.trendhunter.com/slideshow/november-2025-cosmetics", "https://pubmed.ncbi.nlm.nih.gov/40143183", "https://ca.trustpilot.com/review/www.vitalityextracts.com?page=5", "https://www.trustpilot.com/review/www.vitalityextracts.com?page=4", "https://www.trustpilot.com/review/www.planttherapy.com?page=2", "https://www.trustpilot.com/review/fiercenature.co.uk", "https://uk.trustpilot.com/review/fiercenature.co.uk?page=3", "https://www.trustpilot.com/review/beecosmetics.co.uk", "https://ie.trustpilot.com/review/fiercenature.co.uk?page=4", "https://ca.trustpilot.com/review/fiercenature.co.uk?page=7", "https://www.trustpilot.com/review/www.kjserums.com", "https://www.trustpilot.com/review/www.peterthomasroth.com?page=4", "https://www.trustpilot.com/review/skinbunny.co.uk?page=3", "https://www.trustpilot.com/review/musely.com?page=9", "https://uk.trustpilot.com/review/www.peterthomasroth.com?page=3", "https://au.trustpilot.com/review/www.peterthomasroth.com?page=2", "https://www.trustpilot.com/review/amoils.com", "https://www.trustpilot.com/review/hudabeauty.com", "https://www.trustpilot.com/review/uklash.com?page=2", "https://www.trustpilot.com/review/eelhoe.us?page=2", "https://pubmed.ncbi.nlm.nih.gov/40944206", "https://www.trustpilot.com/review/romemd.com", "https://www.trustpilot.com/review/elireskincare.com?page=2", "https://ie.trustpilot.com/review/romemd.com?page=2", "https://ie.trustpilot.com/review/skinphysics.com.au", "https://www.trustpilot.com/review/www.ellessence.co.uk?page=2", "https://www.trustpilot.com/review/harmonyclinic.online", "https://www.trustpilot.com/review/skinphysics.com.au?page=5", "https://ie.trustpilot.com/review/doctorgskincare.com?page=5", "https://www.trustpilot.com/review/lustralotions.com", "https://uk.trustpilot.com/review/www.cowfacebeauty.com", "https://www.vogue.com/article/the-vogue-business-beauty-tracker", "https://www.vogue.com/article/best-serum-for-wrinkles", "https://www.vogue.com/sponsored/article/luxury-skincare-brand-sulwhasoo-celebrates-the-power-of-korean-ginseng-in-new-york", "https://www.vogue.com/article/hydrating-toners", "https://www.vogue.com/article/best-skincare-women-over-50", "https://www.vogue.com/article/best-body-oils", "https://www.vogue.com/article/best-face-mask-any-skin-type", "https://www.vogue.com/article/best-skincare-for-rosacea", "https://www.vogue.com/video/watch/best-of-beauty-secrets-2025", "https://www.vogue.com/article/best-moisturizer-for-oily-skin"]
+    # 测试种子
+    targets = [
+        "https://www.reddit.com/r/MachineLearning",
+        "https://www.reddit.com/r/beauty/comments/1ji1ppw/women_over_55_shoot_me_your_absolute_favorite",
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1m0gk6t/does_anyone_have_a_good_recommendation_for_a",
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1jd2mwd/antiaging_products_breakdown",
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1n6zafx/luxurious_chemo_skincare_routine",
+        "https://www.reddit.com/r/GracefulAgingSkincare/comments/1oyxdv3/would_love_to_hear_from_women_40_whats_actually",
+        "https://www.reddit.com/r/AsianBeauty/comments/1ia8hn8/retinol_vs_retinal_vs_bakuchiol"
+    ]
     
-    # Windows 兼容性设置 (如果是在 Windows 运行)
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
