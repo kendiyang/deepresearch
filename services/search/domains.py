@@ -106,16 +106,6 @@ DOMAINS = [
     },
     {
         "category": "Specific File Types & Institutional Search",
-        "site": "filetype:pdf site:.edu",
-        "description": "Educational Institution PDFs. Limits search to university domains for downloading academic reports and research papers; highly authoritative."
-    },
-    {
-        "category": "Specific File Types & Institutional Search",
-        "site": "filetype:pdf site:.gov",
-        "description": "Government Institution PDFs. Official statistical reports, policy whitepapers, and regulations; the most authoritative and fully free source."
-    },
-    {
-        "category": "Specific File Types & Institutional Search",
         "site": "filetype:pptx",
         "description": "Public PowerPoint Presentations. Directly searches for indexed open industry analysis PPTs, pitch decks, and consulting reports."
     },
@@ -465,14 +455,6 @@ ALL_DOMAINS = [
     {
         "site": "site:capterra.com",
         "description": "软件评测与对比平台。提供详细的软件功能列表、定价对比和用户评分，辅助企业进行IT采购决策。"
-    },
-    {
-        "site": "filetype:pdf site:.edu",
-        "description": "教育机构PDF文档。搜索仅限大学（.edu）域名的学术报告、课程大纲、研究论文，信息的权威性和学术性极高。"
-    },
-    {
-        "site": "filetype:pdf site:.gov",
-        "description": "政府机构PDF文档。搜索政府部门发布的官方统计报告、政策白皮书、法规文件，数据来源最权威。"
     },
     {
         "site": "filetype:pptx",

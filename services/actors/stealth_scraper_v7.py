@@ -2,487 +2,572 @@ import asyncio
 import logging
 import json
 import random
-import re
 import os
-import hashlib
+import sys
+import signal
+import uuid
 import mimetypes
-import aiofiles
-from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import hashlib
+import re
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple, Literal
+from urllib.parse import urlparse, urlencode, urlunparse
 
 # --- 第三方库 ---
-# pip install curl-cffi beautifulsoup4 aiofiles trafilatura
+import aiofiles
+import aiosqlite
 from bs4 import BeautifulSoup
-from curl_cffi.requests import AsyncSession
+from curl_cffi.requests import AsyncSession, RequestsError
+from aiobotocore.session import get_session
 
-# 尝试导入 trafilatura (推荐安装: pip install trafilatura)
+# Pydantic V2
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+# 选装 Trafilatura
 try:
     import trafilatura
     HAS_TRAFILATURA = True
 except ImportError:
     HAS_TRAFILATURA = False
 
-# ================= 配置区域 =================
-OUTPUT_FILE = "scraped_data.jsonl"
-DOWNLOAD_DIR = "downloads"  # 文件保存目录
-PROXY_LIST = []             # 代理列表 e.g. ["http://user:pass@ip:port"]
-MAX_CONCURRENCY = 3         # 并发数
-# ===========================================
-
-# 自动创建下载目录
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger("Scraper")
-
-class ProxyManager:
-    def __init__(self, proxies: List[str]):
-        self.proxies = proxies
+# ================= 1. 深度配置层 (Configuration) =================
+class AppConfig(BaseSettings):
+    APP_NAME: str = "HybridScraper"
+    DATA_DIR: str = "./data"
+    DB_NAME: str = "task_queue.db"
     
-    def get_proxy(self) -> Optional[str]:
-        return random.choice(self.proxies) if self.proxies else None
-
-class UniversalParser:
-    """通用解析器：负责从 HTML 中提取结构化数据"""
+    STORAGE_TYPE: Literal["local", "s3"] = Field(default="local")
     
-    def _clean_text(self, text: str) -> str:
-        if not text: return ""
-        return re.sub(r'\s+', ' ', text).strip()
+    # S3 / MinIO (可选)
+    S3_ENDPOINT_URL: Optional[str] = "http://localhost:9000"
+    S3_ACCESS_KEY: Optional[str] = "minioadmin"
+    S3_SECRET_KEY: Optional[str] = "minioadmin"
+    S3_BUCKET_NAME: str = "crawler-data"
+    S3_REGION_NAME: str = "us-east-1"
+    S3_BATCH_SIZE: int = 50
+    
+    # 爬虫行为
+    MAX_CONCURRENCY: int = 5
+    MAX_RETRIES: int = 3
+    REQUEST_TIMEOUT: int = 60      
+    # 代理列表 (示例) - 如果没有有效代理，建议设为空列表 []
+    PROXY_LIST: List[str] = ["http://127.0.0.1:1080"]      
 
-    def _extract_nextjs_data(self, soup: BeautifulSoup) -> Dict:
-        script = soup.find("script", id="__NEXT_DATA__", type="application/json")
-        if script:
-            try: return json.loads(script.string)
-            except: pass
-        return {}
+    model_config = SettingsConfigDict(
+        env_prefix="CRAWLER_",
+        env_file=".env",
+        extra="ignore"
+    )
 
-    def _recursive_find(self, data: Any, target_keys: List[str], results: List[Any]):
-        if isinstance(data, dict):
-            match = True
-            for k in target_keys:
-                if k not in data:
-                    match = False
-                    break
-            if match: results.append(data)
-            for v in data.values(): self._recursive_find(v, target_keys, results)
-        elif isinstance(data, list):
-            for item in data: self._recursive_find(item, target_keys, results)
+CONFIG = AppConfig()
 
-    def parse(self, html: str, url: str) -> Dict:
-        soup = BeautifulSoup(html, "html.parser")
-        domain = urlparse(url).netloc
-        
-        result = {
-            "url": url,
-            "domain": domain,
-            "type": "generic",
-            "title": "",
-            "content": "",
-            "reviews": [],
-            "total_pages": 0
+# 日志配置
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "lvl": record.levelname,
+            "msg": record.getMessage(),
+            "mod": record.module,
         }
+        return json.dumps(log_obj, ensure_ascii=False)
 
-        # 提取标题
-        if soup.title: result["title"] = self._clean_text(soup.title.string)
+logger = logging.getLogger(CONFIG.APP_NAME)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logger.addHandler(handler)
 
-        # 判断是否为 Trustpilot
-        if "trustpilot.com" in domain:
-            result["type"] = "review_platform"
-            next_data = self._extract_nextjs_data(soup)
-            if next_data:
-                raw_reviews = []
-                self._recursive_find(next_data, ["reviewText", "rating"], raw_reviews)
-                if not raw_reviews:
-                    self._recursive_find(next_data, ["text", "rating"], raw_reviews)
-                
-                for item in raw_reviews:
-                    text = item.get("reviewText") or item.get("text")
-                    if text:
-                        result["reviews"].append({
-                            "rating": item.get("rating"),
-                            "text": text,
-                            "date": item.get("dates", {}).get("publishedDate")
-                        })
-                
-                found_pages = []
-                def find_key(obj, key):
-                    if isinstance(obj, dict):
-                        if key in obj: found_pages.append(obj[key])
-                        for v in obj.values(): find_key(v, key)
-                    elif isinstance(obj, list):
-                        for i in obj: find_key(i, key)
-                find_key(next_data, "totalPages")
-                if found_pages:
-                    vals = [int(x) for x in found_pages if str(x).isdigit()]
-                    if vals: result["total_pages"] = max(vals)
+# ================= 2. 平台专用处理器 (Reddit & TikTok) =================
 
-        else:
-            # 通用网页
-            result["type"] = "article/general"
-            if HAS_TRAFILATURA:
-                # trafilatura 能更好地提取正文
-                extracted = trafilatura.extract(html, include_comments=False)
-                if extracted: result["content"] = extracted
-            
-            # 兜底方案
-            if not result["content"]:
-                paras = [self._clean_text(p.get_text()) for p in soup.find_all("p")]
-                result["content"] = "\n\n".join([p for p in paras if len(p) > 30])
-
-        return result
-
-class StealthScraper:
-    """下载器：支持 HTML 解析与二进制文件流式下载"""
-    def __init__(self, proxy_manager: ProxyManager):
-        self.proxy_manager = proxy_manager
-        self.impersonates = ["chrome120", "safari17_0", "chrome110"]
-        self.parser = UniversalParser()
-
-    def _get_filename(self, url: str, content_type: str) -> str:
-        """优化后的文件名生成逻辑"""
+class RedditHandler:
+    @staticmethod
+    def convert_to_api_url(url: str) -> str:
+        """
+        将普通 Reddit URL 转换为 JSON API URL
+        确保 .json 添加在路径末尾，且不破坏 Query 参数
+        """
         parsed = urlparse(url)
-        path = parsed.path
-        filename = os.path.basename(path)
+        if parsed.path.endswith(".json"):
+            return url
+        
+        # 去除尾部斜杠
+        clean_path = parsed.path.rstrip("/")
+        # 添加 .json
+        new_path = f"{clean_path}.json"
+        
+        # 重组 URL
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            new_path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
 
-        # 1. 尝试使用 URL 中的文件名
-        # 如果文件名存在且有后缀，且不含非法字符
-        if filename and "." in filename and len(filename.split(".")[-1]) <= 5:
-            # 简单清洗非法字符
-            clean_name = re.sub(r'[\\/*?:"<>|]', "", filename)
-            return clean_name
-        
-        # 2. 否则使用 Hash + 猜测后缀
-        ext = mimetypes.guess_extension(content_type.split(";")[0].strip())
-        if not ext: ext = ".bin"
-        file_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-        return f"{file_hash}{ext}"
+    @staticmethod
+    def parse_response(data: Dict, original_url: str) -> Dict:
+        """解析 Reddit JSON 响应"""
+        try:
+            content_type = "reddit_listing"
+            extracted_data = {}
 
-    async def _save_binary(self, response, url: str) -> Dict:
-        """
-        流式保存二进制文件到本地
-        传入 response 对象而非 content 字节
-        """
-        content_type = response.headers.get("content-type", "").lower()
-        filename = self._get_filename(url, content_type)
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        
-        file_size = 0
-        
-        # 流式写入，防止内存溢出
-        async with aiofiles.open(filepath, 'wb') as f:
-            async for chunk in response.aiter_content():
-                await f.write(chunk)
-                file_size += len(chunk)
-        
-        logger.info(f"💾 文件已保存: {filename} ({file_size/1024:.1f} KB)")
-        
-        return {
-            "url": url,
-            "type": "file",
-            "file_path": filepath,
-            "content_type": content_type,
-            "size_bytes": file_size
-        }
-
-    async def fetch_and_process(self, url: str) -> Optional[Dict]:
-        """核心请求方法：支持 stream 模式防止超时"""
-        for attempt in range(3):
-            proxy = self.proxy_manager.get_proxy()
-            impersonate_ver = random.choice(self.impersonates)
-            
-            try:
-                await asyncio.sleep(random.uniform(1, 3))
+            # 情况 A: 详情页 (返回列表: [Post, Comments])
+            if isinstance(data, list) and len(data) > 0:
+                content_type = "reddit_post_detail"
+                post_data = data[0].get('data', {}).get('children', [{}])[0].get('data', {})
+                comments_data = data[1].get('data', {}).get('children', []) if len(data) > 1 else []
                 
-                async with AsyncSession(
-                    impersonate=impersonate_ver,
-                    headers={"Referer": "https://www.google.com/"},
-                    proxies={"http": proxy, "https": proxy} if proxy else None,
-                    timeout=300 # 增加超时时间到 5 分钟
-                ) as session:
-                    # 开启 stream=True，只下载 header 即可开始后续逻辑
-                    response = await session.get(url, stream=True)
-                    
-                    if response.status_code == 200:
-                        content_type = response.headers.get("content-type", "").lower()
-                        
-                        # A. 网页/Json -> 需要手动读取全文并解析
-                        if "text/html" in content_type or "application/json" in content_type:
-                            content = await response.content # 读取完整内容
-                            return self.parser.parse(content.decode('utf-8', errors='ignore'), url)
-                        
-                        # B. 文件 -> 传入 response 流式下载
-                        else:
-                            return await self._save_binary(response, url)
-
-                    elif response.status_code in [403, 429]:
-                        logger.warning(f"🚫 [{response.status_code}] Retry: {url}")
-                        continue
-                    elif response.status_code == 404:
-                        logger.error(f"❌ 404 Not Found: {url}")
-                        return None
+                extracted_data = {
+                    "title": post_data.get("title"),
+                    "selftext": post_data.get("selftext"),
+                    "author": post_data.get("author"),
+                    "ups": post_data.get("ups"),
+                    "upvote_ratio": post_data.get("upvote_ratio"),
+                    "comment_count": post_data.get("num_comments"),
+                    "created_utc": post_data.get("created_utc"),
+                    "top_comments": [c['data'].get('body') for c in comments_data[:3] if 'body' in c.get('data', {})]
+                }
             
-            except Exception as e:
-                logger.error(f"❌ Error {url}: {str(e)}")
-                await asyncio.sleep(1)
+            # 情况 B: 列表页 (Subreddit Listing)
+            elif isinstance(data, dict):
+                children = data.get("data", {}).get("children", [])
+                extracted_data = {
+                    "post_count": len(children),
+                    "posts": [
+                        {
+                            "title": c['data'].get('title'),
+                            "url": c['data'].get('url')
+                        } 
+                        for c in children[:5]
+                    ]
+                }
+
+            return {
+                "url": original_url,
+                "platform": "reddit",
+                "type": content_type,
+                "parsed": extracted_data,
+                "raw_json": data, 
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {"url": original_url, "error": str(e), "raw_partial": str(data)[:200]}
+
+class TikTokHandler:
+    @staticmethod
+    def extract_data(html: str, url: str) -> Optional[Dict]:
+        pattern = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">([^<]+)</script>', html)
+        if not pattern:
+            pattern = re.search(r'<script id="SIGI_STATE" type="application/json">([^<]+)</script>', html)
         
+        if pattern:
+            try:
+                raw_data = json.loads(pattern.group(1))
+                return {
+                    "url": url,
+                    "platform": "tiktok",
+                    "type": "video_meta",
+                    "raw_data": raw_data,
+                    "timestamp": datetime.now().isoformat()
+                }
+            except:
+                pass
         return None
 
-class CrawlerManager:
-    def __init__(self, start_urls: List[str]):
-        self.start_urls = start_urls
-        self.queue = asyncio.Queue()
-        self.seen_urls = set()
-        self.scraper = StealthScraper(ProxyManager(PROXY_LIST))
+# ================= 3. 存储抽象层 (Storage Layer) =================
 
-    def _generate_pagination(self, base_url: str, total_pages: int) -> List[str]:
-        parsed = urlparse(base_url)
-        qs = parse_qs(parsed.query)
-        qs.pop('page', None)
-        links = []
-        for p in range(2, total_pages + 1):
-            qs['page'] = [str(p)]
-            new_query = urlencode(qs, doseq=True)
-            new_url = urlunparse(parsed._replace(query=new_query))
-            links.append(new_url)
-        return links
+class StorageBackend(ABC):
+    @abstractmethod
+    async def initialize(self): pass
+    @abstractmethod
+    async def save_asset(self, content: bytes, filename: str, content_type: str) -> str: pass
+    @abstractmethod
+    async def save_data(self, record: Dict): pass
+    @abstractmethod
+    async def close(self): pass
+
+class LocalStorage(StorageBackend):
+    def __init__(self, base_dir: str):
+        self.base_dir = base_dir
+        self.downloads_dir = os.path.join(base_dir, "downloads")
+        self.data_file = os.path.join(base_dir, "scraped_data.jsonl")
+        self._file_handle = None
+
+    async def initialize(self):
+        os.makedirs(self.downloads_dir, exist_ok=True)
+        self._file_handle = await aiofiles.open(self.data_file, mode='a', encoding='utf-8', buffering=1)
+        logger.info(f"💾 Local Storage initialized at {self.base_dir}")
+
+    async def save_asset(self, content: bytes, filename: str, content_type: str) -> str:
+        filepath = os.path.join(self.downloads_dir, filename)
+        async with aiofiles.open(filepath, 'wb') as f:
+            await f.write(content)
+        return filepath
+
+    async def save_data(self, record: Dict):
+        if self._file_handle:
+            await self._file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            await self._file_handle.flush()
+
+    async def close(self):
+        if self._file_handle:
+            await self._file_handle.close()
+
+class S3Storage(StorageBackend):
+    def __init__(self):
+        self.session = get_session()
+        self.client = None
+        self.bucket = CONFIG.S3_BUCKET_NAME
+        self.buffer = []
+
+    async def initialize(self):
+        self.client = await self.session.create_client(
+            's3', endpoint_url=CONFIG.S3_ENDPOINT_URL,
+            aws_access_key_id=CONFIG.S3_ACCESS_KEY,
+            aws_secret_access_key=CONFIG.S3_SECRET_KEY,
+            region_name=CONFIG.S3_REGION_NAME
+        ).__aenter__()
+        logger.info("☁️ S3 Storage initialized")
+
+    async def save_asset(self, content: bytes, filename: str, content_type: str) -> str:
+        key = f"assets/{filename}"
+        await self.client.put_object(Bucket=self.bucket, Key=key, Body=content, ContentType=content_type)
+        return f"s3://{self.bucket}/{key}"
+
+    async def save_data(self, record: Dict):
+        self.buffer.append(record)
+        if len(self.buffer) >= CONFIG.S3_BATCH_SIZE:
+            await self._flush()
+
+    async def _flush(self):
+        if not self.buffer: return
+        data = list(self.buffer)
+        self.buffer.clear()
+        key = f"data/{uuid.uuid4().hex}.jsonl"
+        body = "\n".join([json.dumps(r, ensure_ascii=False) for r in data]).encode('utf-8')
+        await self.client.put_object(Bucket=self.bucket, Key=key, Body=body)
+
+    async def close(self):
+        await self._flush()
+        if self.client: await self.client.__aexit__(None, None, None)
+
+# ================= 4. 数据持久层 (DB) =================
+class TaskManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._db = None
+        self._lock = asyncio.Lock()
+
+    async def init_db(self):
+        self._db = await aiosqlite.connect(self.db_path)
+        await self._db.execute("PRAGMA journal_mode=WAL;")
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                url TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'PENDING',
+                retry_count INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self._db.commit()
+
+    async def add_tasks(self, urls: List[str]):
+        if not urls: return
+        async with self._lock:
+            await self._db.executemany(
+                "INSERT OR IGNORE INTO tasks (url) VALUES (?)", [(u,) for u in urls]
+            )
+            await self._db.commit()
+
+    async def acquire_task(self) -> Optional[Tuple[str, int]]:
+        # 获取待处理任务 (PENDING 或 失败次数未超限的 FAILED)
+        q = f"""
+            UPDATE tasks
+            SET status = 'PROCESSING', updated_at = CURRENT_TIMESTAMP
+            WHERE url = (
+                SELECT url FROM tasks 
+                WHERE status = 'PENDING' 
+                OR (status = 'FAILED' AND retry_count < ?)
+                LIMIT 1
+            )
+            RETURNING url, retry_count
+        """
+        async with self._lock:
+            try:
+                async with self._db.execute(q, (CONFIG.MAX_RETRIES,)) as cursor:
+                    row = await cursor.fetchone()
+                if row:
+                    await self._db.commit()
+                    return row
+                return None
+            except Exception as e:
+                logger.error(f"DB Acquire Error: {e}")
+                return None
+
+    async def update_task(self, url: str, status: str, fatal_error: bool = False):
+        async with self._lock:
+            if status == 'FAILED':
+                if fatal_error:
+                    # 如果是致命错误 (如 404)，直接将重试次数设为最大，防止再次提取
+                    await self._db.execute(
+                        "UPDATE tasks SET status=?, retry_count=999 WHERE url=?", 
+                        (status, url)
+                    )
+                else:
+                    await self._db.execute(
+                        "UPDATE tasks SET status=?, retry_count=retry_count+1 WHERE url=?", 
+                        (status, url)
+                    )
+            else:
+                await self._db.execute("UPDATE tasks SET status=? WHERE url=?", (status, url))
+            await self._db.commit()
+
+    async def close(self):
+        if self._db: await self._db.close()
+
+# ================= 5. 网络与解析层 (关键修改版) =================
+class NetworkEngine:
+    def __init__(self, storage: StorageBackend):
+        self.storage = storage
+        # 移除 safari，优先使用 chrome 系列以获得更好的 API 兼容性
+        self.impersonates = ["chrome120", "chrome124"]
+
+    def _is_reddit_url(self, url: str) -> bool:
+        return "reddit.com" in url
+
+    def _is_tiktok_url(self, url: str) -> bool:
+        return "tiktok.com" in url
+
+    async def fetch_and_process(self, url: str) -> Literal["SUCCESS", "RETRY", "FATAL"]:
+        """
+        返回状态码:
+        SUCCESS: 成功
+        RETRY: 软错误 (超时, 5xx)
+        FATAL: 硬错误 (404, 权限拒绝) -> 不再重试
+        """
+        proxy = random.choice(CONFIG.PROXY_LIST) if CONFIG.PROXY_LIST else None
+        proxies = {"http": proxy, "https": proxy} if proxy else {}
+
+        target_url = url
+        
+        # ⚠️ 关键修改 1: 不要手动设置 User-Agent，让 impersonate 自动处理
+        # 仅设置语言偏好，这不会破坏 TLS 指纹
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        }
+        
+        if self._is_reddit_url(url):
+            target_url = RedditHandler.convert_to_api_url(url)
+            # Reddit API 对 Content-Type 有时敏感
+            headers["Accept"] = "*/*"
+
+        try:
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+
+            # ⚠️ 关键修改 2: impersonate 自动处理指纹
+            async with AsyncSession(
+                impersonate=random.choice(self.impersonates),
+                proxies=proxies,
+                headers=headers,
+                timeout=CONFIG.REQUEST_TIMEOUT
+            ) as s:
+                
+                logger.debug(f"🔍 Requesting: {target_url}")
+                response = await s.get(target_url)
+                
+                # --- 404 处理 (Reddit 专用) ---
+                if response.status_code == 404:
+                    logger.warning(f"⛔️ Resource Not Found (404): {target_url}")
+                    return "FATAL" # 致命错误，不重试
+
+                # --- 权限/速率限制处理 ---
+                if response.status_code in [403, 429]:
+                    logger.warning(f"⚠️ Access Denied/Rate Limit ({response.status_code}): {url}")
+                    return "RETRY"
+
+                if response.status_code != 200:
+                    logger.warning(f"⚠️ HTTP {response.status_code} - {url}")
+                    return "RETRY"
+                
+                # --- 成功响应处理 ---
+                
+                # 1. Reddit JSON
+                if self._is_reddit_url(url):
+                    try:
+                        json_data = response.json()
+                        parsed = RedditHandler.parse_response(json_data, url)
+                        await self.storage.save_data(parsed)
+                        logger.info(f"✅ Saved Reddit JSON: {url}")
+                        return "SUCCESS"
+                    except json.JSONDecodeError:
+                        logger.error(f"❌ Reddit returned non-JSON content for: {target_url}")
+                        # 如果 API 返回了 HTML (通常是 Cloudflare 盾)，则重试
+                        return "RETRY"
+
+                content_type = response.headers.get("content-type", "").lower()
+                
+                # 2. TikTok Meta
+                if self._is_tiktok_url(url) and "text/html" in content_type:
+                    tiktok_data = TikTokHandler.extract_data(response.text, url)
+                    if tiktok_data:
+                        await self.storage.save_data(tiktok_data)
+                        logger.info(f"✅ Saved TikTok Meta: {url}")
+                        return "SUCCESS"
+                
+                # 3. 通用 HTML
+                if "text/html" in content_type:
+                    data = self._parse_html(response.text, url)
+                    await self.storage.save_data(data)
+                    logger.info(f"✅ Saved HTML: {url}")
+                
+                # 4. 通用文件下载
+                else:
+                    filename = self._get_filename(url, content_type)
+                    path = await self.storage.save_asset(response.content, filename, content_type)
+                    meta = {
+                        "url": url, "type": "asset", "path": path,
+                        "size": len(response.content), "ts": datetime.now().isoformat()
+                    }
+                    await self.storage.save_data(meta)
+                    logger.info(f"✅ Saved Asset: {filename}")
+                
+                return "SUCCESS"
+
+        except RequestsError as e:
+            logger.error(f"❌ Network Error {url}: {e}")
+            return "RETRY"
+        except Exception as e:
+            logger.error(f"❌ System Error {url}: {e}")
+            return "RETRY"
+
+    def _parse_html(self, html: str, url: str) -> Dict:
+        soup = BeautifulSoup(html, "html.parser")
+        content = ""
+        if HAS_TRAFILATURA:
+            try:
+                content = trafilatura.extract(html, include_comments=False)
+            except: pass
+            
+        if not content:
+            paras = [p.get_text().strip() for p in soup.find_all("p")]
+            content = "\n".join([p for p in paras if len(p) > 20])
+
+        title = soup.title.string.strip() if soup.title else "No Title"
+        return {
+            "url": url,
+            "type": "html",
+            "title": title,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def _get_filename(self, url: str, content_type: str) -> str:
+        parsed = urlparse(url)
+        path = parsed.path
+        name = os.path.basename(path)
+        if not name or "." not in name:
+            ext = mimetypes.guess_extension(content_type.split(';')[0]) or ".bin"
+            hash_name = hashlib.md5(url.encode()).hexdigest()
+            name = f"{hash_name}{ext}"
+        return name
+
+# ================= 6. 主编排 (Orchestrator) =================
+class CrawlerEngine:
+    def __init__(self):
+        if CONFIG.STORAGE_TYPE == "s3":
+            self.storage = S3Storage()
+        else:
+            self.storage = LocalStorage(CONFIG.DATA_DIR)
+            
+        self.db = TaskManager(os.path.join(CONFIG.DATA_DIR, CONFIG.DB_NAME))
+        self.network = NetworkEngine(self.storage)
+        self.shutdown_event = asyncio.Event()
 
     async def worker(self, worker_id: int):
-        # 优化：在循环外打开文件，减少 IO 开销
-        async with aiofiles.open(OUTPUT_FILE, mode='a', encoding='utf-8') as f:
-            while True:
-                try:
-                    # 等待任务，如果队列长时间为空则可能已经结束
-                    url = await asyncio.wait_for(self.queue.get(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    if self.queue.empty(): break
+        logger.info(f"👷 Worker-{worker_id} ready")
+        while not self.shutdown_event.is_set():
+            try:
+                task = await self.db.acquire_task()
+                if not task:
+                    await asyncio.sleep(2)
                     continue
-
-                if url in self.seen_urls:
-                    self.queue.task_done()
-                    continue
-                self.seen_urls.add(url)
-
-                logger.info(f"👷 [Worker-{worker_id}] 任务: {url}")
-                data = await self.scraper.fetch_and_process(url)
-
-                if data:
-                    save_data = {
-                        "url": data["url"],
-                        "type": data["type"],
-                        "timestamp": asyncio.get_event_loop().time()
-                    }
-
-                    if data["type"] == "file":
-                        save_data["local_path"] = data["file_path"]
-                        save_data["content_type"] = data["content_type"]
-                        save_data["file_size"] = data["size_bytes"]
+                
+                url, retry_cnt = task
+                logger.info(f"▶️ Worker-{worker_id} processing: {url} (Retry: {retry_cnt})")
+                
+                # 获取执行结果状态
+                status = await self.network.fetch_and_process(url)
+                
+                if status == "SUCCESS":
+                    await self.db.update_task(url, "COMPLETED")
+                elif status == "FATAL":
+                    logger.error(f"💀 Worker-{worker_id} marking FATAL error for: {url}")
+                    await self.db.update_task(url, "FAILED", fatal_error=True)
+                else: # RETRY
+                    await self.db.update_task(url, "FAILED", fatal_error=False)
                     
-                    elif data["type"] == "review_platform":
-                        save_data["title"] = data["title"]
-                        save_data["reviews"] = data["reviews"]
-                        # Trustpilot 分页逻辑
-                        if data.get("total_pages", 0) > 1 and ("page=" not in url or "page=1" in url):
-                            logger.info(f"✨ 发现 {data['total_pages']} 页，生成任务...")
-                            new_links = self._generate_pagination(url, data["total_pages"])
-                            for link in new_links:
-                                if link not in self.seen_urls: await self.queue.put(link)
-                    
-                    else: # generic article
-                        save_data["title"] = data["title"]
-                        save_data["content"] = data["content"]
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker-{worker_id} Loop Error: {e}")
+                await asyncio.sleep(1)
 
-                    # 写入一行 JSONL
-                    await f.write(json.dumps(save_data, ensure_ascii=False) + "\n")
-                    await f.flush() # 确保写入
+    async def run(self, seeds: List[str]):
+        os.makedirs(CONFIG.DATA_DIR, exist_ok=True)
+        await self.db.init_db()
+        await self.db.add_tasks(seeds)
+        await self.storage.initialize()
+        
+        loop = asyncio.get_running_loop()
+        if sys.platform != "win32":
+            try:
+                loop.add_signal_handler(signal.SIGINT, lambda: self.shutdown_event.set())
+                loop.add_signal_handler(signal.SIGTERM, lambda: self.shutdown_event.set())
+            except NotImplementedError:
+                pass
 
-                self.queue.task_done()
-
-    async def run(self):
-        for url in self.start_urls: await self.queue.put(url)
-        workers = [asyncio.create_task(self.worker(i)) for i in range(MAX_CONCURRENCY)]
-        await self.queue.join()
-        for w in workers: w.cancel()
-        logger.info(f"🎉 全部完成。数据已保存至 {OUTPUT_FILE}，文件已保存至 {DOWNLOAD_DIR}/")
+        logger.info(f"🚀 Engine Started | Storage: {CONFIG.STORAGE_TYPE} | Workers: {CONFIG.MAX_CONCURRENCY}")
+        
+        workers = [asyncio.create_task(self.worker(i)) for i in range(CONFIG.MAX_CONCURRENCY)]
+        
+        try:
+            while not self.shutdown_event.is_set():
+                if all(w.done() for w in workers):
+                    break
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("🛑 Received Stop Signal")
+            self.shutdown_event.set()
+        finally:
+            self.shutdown_event.set()
+            logger.info("⏳ Shutting down workers...")
+            await asyncio.gather(*workers, return_exceptions=True)
+            await self.db.close()
+            await self.storage.close()
+            logger.info("👋 Shutdown Complete.")
 
 if __name__ == "__main__":
-    # 示例目标列表
-    targets   = [
-    "https://pubmed.ncbi.nlm.nih.gov/38127865",
-    "https://pubmed.ncbi.nlm.nih.gov/29450138",
-    "https://pubmed.ncbi.nlm.nih.gov/32013535",
-    "https://pubmed.ncbi.nlm.nih.gov/39612685",
-    "https://pubmed.ncbi.nlm.nih.gov/30539810",
-    "https://pubmed.ncbi.nlm.nih.gov/37430475",
-    "https://pubmed.ncbi.nlm.nih.gov/PMC8098784",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC6544398",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC7330179",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9268443",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC11481677",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC12669112",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC11193358",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC11876528",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10603989",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9548261",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC8300764",
-    "https://digitalcommons.unl.edu/context/biotechpapers/article/1029/viewcontent/Khan_ISCIENCE_2022_Genome_structure.pdf",
-    "https://reclaim.cdh.ucla.edu/download/papersCollection/HBmjEs/Extraction%20Of%20Essential%20Oil%20And%20Its%20Applications.pdf",
-    "https://admisiones.unicah.edu/uploaded-files/FZ4vJL/5OK101/how_to_use-essential-oils.pdf",
-    "https://digitalcommons.liberty.edu/cgi/viewcontent.cgi?article=2032&context=honors",
-    "https://cornerstone.lib.mnsu.edu/cgi/viewcontent.cgi?article=2077&context=etds",
-    "https://repository.najah.edu/bitstreams/b721ecde-6b21-4bbc-809d-849e31e17387/download",
-    "https://repository.sustech.edu/jspui/bitstream/123456789/18582/1/Investigation%20of%20Phytochemicals%20From....pdf",
-    "https://researchrepository.wvu.edu/cgi/viewcontent.cgi?article=12511&context=etd",
-    "https://www.nel.edu/userfiles/articlesnew/NEL370816A06.pdf",
-    "https://digitalcommons.csbsju.edu/cgi/viewcontent.cgi?article=1151&context=ur_cscday",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.3390/biom9110738&link_type=DOI",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.3390/ijerph17186506&link_type=DOI",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.1016/j.fochx.2022.100217&link_type=DOI",
-    "https://www.medrxiv.org/content/10.1101/2023.09.22.23295947v1.full.pdf",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.2147/ccid.S286411&link_type=DOI",
-    "https://www.medrxiv.org/content/10.1101/2024.01.30.24302041v1.full.pdf",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.1111/bph.13059&link_type=DOI",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.3389/fphar.2020.578970&link_type=DOI",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.1111/wrr.13130&link_type=DOI",
-    "https://www.medrxiv.org/lookup/external-ref?access_num=10.3389/fnut.2017.00052&link_type=DOI",
-    "https://ca.trustpilot.com/review/www.vitalityextracts.com",
-    "https://ca.trustpilot.com/review/vedaoils.com?page=2",
-    "https://ie.trustpilot.com/review/www.vitalityextracts.com?page=4",
-    "https://uk.trustpilot.com/review/www.vitalityextracts.com?page=2",
-    "https://ca.trustpilot.com/review/freshskin.co.uk?page=3",
-    "https://ca.trustpilot.com/review/www.planttherapy.com?page=2",
-    "https://ca.trustpilot.com/review/beecosmetics.co.uk?page=2",
-    "https://ca.trustpilot.com/review/majesticpure.com",
-    "https://au.trustpilot.com/review/vedaoils.com?page=7",
-    "https://ca.trustpilot.com/review/wholesalebotanics.com?page=8",
-    "https://www.vogue.com/article/best-winter-body-oil-rodin-elizabeth-arden",
-    "https://www.vogue.com/article/elle-macpherson-beauty-secrets",
-    "https://www.vogue.com/article/best-collagen-creams",
-    "https://www.vogue.com/article/palo-santo-hair-skincare-fragrance",
-    "https://www.vogue.com/article/best-retinol-serums-creams",
-    "https://www.vogue.com/article/dark-spot-removal-retin-a-intense-pulsed-light-lasers-and-more",
-    "https://www.vogue.com/article/travel-beauty-long-haul-flight-sleep-skin-hydration-tips-body-face-massage-intermittent-fasting",
-    "https://www.vogue.com/article/best-facial-sunscreens",
-    "https://www.vogue.com/article/best-summer-fragrances",
-    "https://www.trendhunter.com/slideshow/rejuvenating-skincare",
-    "https://www.trendhunter.com/trends/pure-botanical-face-serum",
-    "https://www.trendhunter.com/trends/clarifying-face-elixir",
-    "https://www.trendhunter.com/trends/beauty-booster",
-    "https://www.trendhunter.com/slideshow/april-2025-cosmetics",
-    "https://pdfs.semanticscholar.org/e80a/a91e6d6aa8673b3cd6cec2f0891d0532c906.pdf",
-    "https://media.doterra.com/us/en/ebooks/frankincense.pdf",
-    "https://ppj.phypha.ir/article-1-1905-en.pdf",
-    "https://naturalingredient.org/wp/wp-content/uploads/1377986878.pdf",
-    "https://www.rareessencearomatherapy.com/wp-content/uploads/2021/08/Product-Info-EO-Single-Note-Frankincense.pdf",
-    "https://www.rangeproducts.com.au/wp-content/uploads/2023/02/ESSENTIAL-OILS-FOR-THE-SKIN-PDF.pdf?srsltid=AfmBOoqKhYiQtBO1JGNfK7wBaEduLIXrGdhbuufLeMwH5K__jSPqLHJZ",
-    "https://www.playitforwardsportstherapy.com/wp-content/uploads/2015/08/Frankincense-product-info.pdf",
-    "https://www.jintegrativederm.org/api/v1/articles/136390-essential-oils-in-dermatology.pdf",
-    "https://article.sciencepublishinggroup.com/pdf/jps.20210902.14",
-    "https://naha.org/assets/product-downloads/NAHA_Webinar_Colleen_Quinn_Sept_2020.pdf",
-    "https://www.trustpilot.com/review/www.vitalityextracts.com",
-    "https://www.trustpilot.com/review/vedaoils.com",
-    "https://www.trustpilot.com/review/www.planttherapy.com?page=2",
-    "https://www.trustpilot.com/review/beecosmetics.co.uk",
-    "https://www.trustpilot.com/review/sevenminerals.com",
-    "https://www.trustpilot.com/review/majesticpure.com",
-    "https://www.trustpilot.com/review/www.nealsyardremedies.com",
-    "https://ie.trustpilot.com/review/freshskin.co.uk?page=5",
-    "https://www.trustpilot.com/review/youngliving.com",
-    "https://www.trustpilot.com/review/purextracts.co.uk",
-    "https://www.trendhunter.com/trends/affordable-clean-skincare",
-    "https://research.sabanciuniv.edu/52101/1/Extraction.pdf",
-    "https://admisiones.unicah.edu/Resources/uGVgwj/9OK174/essential__oil__guide.pdf",
-    "https://sites.bu.edu/bbrain/files/2022/05/placebo-botanical-2.pdf",
-    "https://files.achs.edu/mediabank/files/melissa_clanton.pdf",
-    "https://researchmgt.monash.edu/ws/portalfiles/portal/423808167/380897839_oa.pdf",
-    "https://digitalcommons.liu.edu/cgi/viewcontent.cgi?article=1008&context=brooklyn_fulltext_master_theses",
-    "https://www.stonybrookmedicine.edu/sites/default/files/herbal_medicines_interactions-1.pdf",
-    "https://cdn.clinicaltrials.gov/large-docs/03/NCT02543203/Prot_SAP_000.pdf",
-    "https://jra.jacksonms.gov/browse/uGVgwj/9OK174/EssentialOilGuide.pdf",
-    "https://par.nsf.gov/servlets/purl/10043797",
-    "https://www.va.gov/WHOLEHEALTHLIBRARY/docs/Clinician-Guide-Dietary-Supplements-for-Pain.pdf",
-    "https://ww2.jacksonms.gov/book-search/YFjgtK/2OK045/WellnessGuide101Wrinkles.pdf",
-    "https://downloads.regulations.gov/FDA-2019-N-1482-4185/attachment_1.pdf",
-    "https://www.parks.pearlandtx.gov/Home/Components/Form/Form/ShowFormFileN?ID=9022f6d9b0564f75bcda178c0bc79324",
-    "https://www.sec.gov/Archives/edgar/data/1678746/000114036120017712/filename2.pdf",
-    "https://effectivehealthcare.ahrq.gov/sites/default/files/related_files/cer-272-genitourinary-syndrome.pdf",
-    "https://jra.jacksonms.gov/libweb/uGVgwj/9OK174/essential__oil__guide.pdf",
-    "https://uk.trustpilot.com/review/beecosmetics.co.uk?page=4",
-    "https://www.vogue.com/article/chi-the-spa-at-shangri-la-barr-al-jissah",
-    "https://www.vogue.com/article/gwyneth-paltrow-skin-care-and-makeup-routine-beauty-secrets",
-    "https://www.vogue.com/article/ayond-new-desert-oriented-skincare-brand-wellness",
-    "https://www.vogue.com/article/beauty-cures-for-the-summer-gardener",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10735031",
-    "https://www.rjptonline.org/HTMLPaper.aspx?Journal=Research%20Journal%20of%20Pharmacy%20and%20Technology;PID=2024-17-5-71",
-    "https://www.researchgate.net/publication/376749888_Protective_potential_of_frankincense_essential_oil_and_its_loaded_solid_lipid_nanoparticles_against_UVB-induced_photodamage_in_rats_via_MAPK_and_PI3KAKT_signaling_pathways_A_promising_anti-aging_thera",
-    "https://manukarx.co.nz/blogs/news/frankincense-oil-benefits",
-    "https://www.annmariegianni.com/frankincense-oil-for-wrinkles?srsltid=AfmBOorcc1QWJNOK8LwS8r5IQKSafYpuTzTIdksmHsEMI4t3alsI1hLK",
-    "https://draxe.com/essential-oils/what-is-frankincense",
-    "https://hiqili.com/blogs/wellness/how-to-dilute-frankincense-oil-for-skin?srsltid=AfmBOopjAM7O-BwLyb-_CgM7hR4xX0cJt0gWZLvEjQ7h-UkA7TTZGtfZ",
-    "https://www.bcalm.co.uk/blogs/news/the-amazing-qualities-of-organic-frankincense-essential-oil?srsltid=AfmBOorCD0Tw6hzkXtkltRYQ4lMKi51S32S1-gngdjm8moyqnhLfCQyd",
-    "https://www.rockymountainoils.com/pages/frankincense-oil-benefits-uses?srsltid=AfmBOooVfdPFs1kvDDR8d0iZ8wzG9lqOrxIYhmDR9nEhbfKbMk5KwZGN",
-    "https://www.bmvfragrances.com/news-blogs/frankincense-oil-a-natural-anti-ageing-solution-for-youthful-and-radiant-skin",
-    "https://ca.trustpilot.com/review/pearldeflore.com",
-    "https://ca.trustpilot.com/review/cellexialabs.com",
-    "https://ca.trustpilot.com/review/strivectin.com",
-    "https://www.trustpilot.com/review/www.peterthomasroth.com",
-    "https://www.trustpilot.com/review/theperfectcosmetics.co",
-    "https://ie.trustpilot.com/review/wrinklesystem.com",
-    "https://nz.trustpilot.com/review/pearldeflore.com?page=3",
-    "https://nz.trustpilot.com/review/cellexialabs.com?page=5",
-    "https://nz.trustpilot.com/review/theperfectcosmetics.co?page=5",
-    "https://ca.trustpilot.com/review/musely.com",
-    "https://www.vogue.com/article/best-under-eye-patches",
-    "https://www.vogue.com/article/best-eye-cream-for-dark-circles",
-    "https://www.cosmoprof.com/en/media-room/news/cosmoprof-and-cosmopack-awards-asia-2025-discover-the-winners",
-    "https://www.cosmoprof.com/en/media-room/news/discover-the-winners-of-the-2024-cosmoprof-and-cosmopack-asia-awards",
-    "https://www.cosmoprof.com/media/cosmoprof/2025/Progetti%20Speciali/BROCHURE_PROGETTI_SOSTENIBILITA__250310.pdf",
-    "https://www.cosmoprof.com/media/cosmoprof/2023/news/_11_07_CPA_CTReport_2022_MASTER_compressed.pdf",
-    "https://www.cosmoprof.com/media/cosmoprof/2022/news/BEAUTYSTREAMS_CPNA_Report-1.pdf",
-    "https://www.cosmoprof.com/media/cosmoprof/2022/CosmoTrends/Report/CosmoTrends_report_part1.pdf",
-    "https://www.cosmoprof.com/media/cosmoprof/Country%20Pavilion/2019/Cpbo_19_Poland.pdf",
-    "https://www.cosmoprof.com/en/media-room/news/the-keys-to-success-for-cosmoprof-awards-winners",
-    "https://www.cosmoprof.com/media/cosmoprof/cosmoprime/Special%20areas%20Brochure/brochureweb_cosmoprof_EGGreen_2019.pdf",
-    "https://www.trendhunter.com/slideshow/september-2025-cosmetics",
-    "https://www.trendhunter.com/protrends/spiritual-cosmetic",
-    "https://www.trendhunter.com/megatrend/youthfulness",
-    "https://www.trendhunter.com/trends/regenerative-skin-care",
-    "https://www.trendhunter.com/slideshow/september-2025-fashion",
-    "https://ascpd.org.au/wp-content/uploads/ASCD-Journal-Edition-10-Cosmeceuticals.pdf",
-    "https://www.researchgate.net/publication/373402145_Effectiveness_and_Tolerance_of_Multi-Corrective_Topical_Treatment_for_Infraorbital_Dark_Circles_and_Puffiness/fulltext/64e9f1650453074fbdb437e0/Effectiveness-and-Tolerance-of-Multi-Corrective_Topical-Treatment-for-Infraorbital_Dark_Circles-and-Puffiness.pdf",
-    "https://www.cathaypacific.com/content/dam/focal-point/cx/products/emporium/2020q3/emp_20q3_emagazine_full_12mb.pdf",
-    "https://eadv.org/wp-content/uploads/scientific-abstracts/EADV-congress-2024/Corrective-aesthetic-and-cosmetic-dermatology.pdf",
-    "https://www.cosmoprof-asia.com/wp-content/uploads/2023/10/Cosmoprof-Asia-2023-Korean-Pavilion_FinalLR.pdf",
-    "https://www.lifeextension.com/-/media/lifeextension/pdf/magazine/2017/9.pdf?rev=e33f21c0eb39479cb50a27db4f5e0e6e&srsltid=AfmBOordodx7Be9O5e6vG6dX1VskCTZfOBLJW_XNoUrJi0a1EWXfggvm",
-    "https://www.lifeextension.asia/pub/media/magefan_blog/52.pdf",
-    "https://www.asx.com.au/asxpdf/20100423/pdf/31pygl8vv7l5rg.pdf",
-    "https://cosmoprofnorthamerica.com/wp-content/uploads/BEAUTYSTREAMS_CPNA_Report-1.pdf",
-    "https://sg.cmbi.com/upload/202206/20220621725871.pdf",
-    "https://www.mckinsey.com/~/media/mckinsey/business%20functions/strategy%20and%20corporate%20finance/our%20insights/mckinsey%20on%20finance%20number%2080/mckinsey-on-finance-number-80.pdf",
-    "https://ca.trustpilot.com/review/theordinary.com",
-    "https://ie.trustpilot.com/review/theordinary.com?page=5",
-    "https://uk.trustpilot.com/review/theordinary.com?page=4",
-    "https://ca.trustpilot.com/review/adorecosmetics.com",
-    "https://ca.trustpilot.com/review/dor24k.com",
-    "https://ca.trustpilot.com/review/cellexialabs.com?page=9",
-    "https://ca.trustpilot.com/review/upcirclebeauty.com",
-    "https://ca.trustpilot.com/review/beautyfrombees.ca",
-    "https://ca.trustpilot.com/review/www.freshlycosmetics.com",
-    "https://www.thinkwithgoogle.com/intl/en-emea/marketing-strategies/video/almarai-youtube-ramadan-ai-ads",
-    "https://www.businessinsider.com/sitemap/2021-02.xml"
-]
+    # 测试种子
+    targets = [
+        "https://www.reddit.com/r/MachineLearning",
+        "https://www.reddit.com/r/beauty/comments/1ji1ppw/women_over_55_shoot_me_your_absolute_favorite",
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1m0gk6t/does_anyone_have_a_good_recommendation_for_a",
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1jd2mwd/antiaging_products_breakdown",
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1n6zafx/luxurious_chemo_skincare_routine",
+        "https://www.reddit.com/r/GracefulAgingSkincare/comments/1oyxdv3/would_love_to_hear_from_women_40_whats_actually",
+        "https://www.reddit.com/r/AsianBeauty/comments/1ia8hn8/retinol_vs_retinal_vs_bakuchiol"
+    ]
+    
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Windows 平台必须设置此 Policy 才能支持 asyncio + curl_cffi
+    engine = CrawlerEngine()
     try:
-        import sys
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except ImportError:
+        asyncio.run(engine.run(targets))
+    except KeyboardInterrupt:
         pass
-
-    crawler = CrawlerManager(targets)
-    asyncio.run(crawler.run())

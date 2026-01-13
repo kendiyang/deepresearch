@@ -9,6 +9,7 @@ from config.config import config
 import httpx
 from services.search.dorks import DorkResult
 from pydantic import BaseModel
+from services.search.domains import DOMAINS
 
 # 导入缓存层
 try:
@@ -220,6 +221,37 @@ class SearchService:
         except Exception:
             return None
 
+    @staticmethod
+    @lru_cache()
+    def _build_allowed_domain_tokens() -> List[str]:
+        """从 services.search.domains.DOM AINS 中解析出允许的 domain token 列表。
+
+        解析规则：查找字符串中 'site:' 后的部分，去除路径，仅保留主机或后缀（例如 '.edu' 会被保留）。
+        返回的 token 可用于后续的后缀或精确匹配检测。
+        """
+        tokens: List[str] = []
+        for entry in DOMAINS:
+            site_val = entry.get("site", "") if isinstance(entry, dict) else ""
+            if not site_val or "site:" not in site_val:
+                # 只处理明确包含 site: 的条目，忽略 filetype: 或其他非 site 条目
+                continue
+            part = site_val.split("site:", 1)[1].strip()
+            # 如果包含空格或其他 operators, 只取第一个 token
+            part = part.split()[0]
+            # 取第一个 path segment（域名部分）
+            domain_candidate = part.split("/")[0]
+            if not domain_candidate:
+                continue
+            domain_candidate = domain_candidate.lower()
+            # 基本合法性检查：必须包含至少一个点或以 . 开头（如 .edu）
+            if '.' not in domain_candidate and not domain_candidate.startswith('.'):
+                continue
+            tokens.append(domain_candidate)
+        # 去重并返回
+        tokens = list(dict.fromkeys(tokens))
+        logger.debug("Allowed domain tokens built: %s", tokens)
+        return tokens
+
     def _extract_valid_items(self, results: dict, *, dork: str) -> List["DiscoveryItem"]:
         """从 serper 返回结果中提取经过平台验证的结构化结果"""
         items: List[DiscoveryItem] = []
@@ -266,6 +298,50 @@ class SearchService:
         except Exception:
             return False
 
+        # 先检查域名是否在 DOMAINS 白名单中
+        allowed_tokens = self._build_allowed_domain_tokens()
+
+        def host_matches_token(h: str, token: str) -> bool:
+            if token.startswith('.'):
+                return h.endswith(token)
+            if h == token:
+                return True
+            return h.endswith('.' + token)
+
+        domain_allowed = any(host_matches_token(host, tok) for tok in allowed_tokens)
+        if not domain_allowed:
+            logger.debug("链接域名未在白名单，拒绝: %s", host)
+            return False
+
+        # 域名被允许后，再应用已有的站点级路径过滤规则
+        # Reddit: 只允许 /r/ 下的讨论和帖子，排除 wiki/about/search
+        if "reddit.com" in host:
+            path = parsed.path
+            if not path.startswith("/r/"):
+                logger.debug("reddit 链接非 /r/ 下，拒绝: %s", link)
+                return False
+            if any(x in path for x in ["/about", "/wiki", "/search"]):
+                logger.debug("reddit 链接为系统页面，拒绝: %s", link)
+                return False
+            return True
+
+        # TikTok: 仅允许含 /video/ 的内容页
+        if "tiktok.com" in host:
+            ok = "/video/" in parsed.path
+            if not ok:
+                logger.debug("tiktok 非视频页，拒绝: %s", link)
+            return ok
+
+        # YouTube: 仅允许 watch 或 shorts
+        if "youtube.com" in host or "youtu.be" in host:
+            ok = ("watch?v=" in link) or ("/shorts/" in parsed.path)
+            if not ok:
+                logger.debug("youtube 非 watch/shorts，拒绝: %s", link)
+            return ok
+
+        # 其他已在白名单域名，允许
+        return True
+
         if "reddit.com" in host:
             # 允许板块内的帖子和讨论，排除个人主页、系统页面
             path = parsed.path
@@ -281,5 +357,19 @@ class SearchService:
         if "youtube.com" in host or "youtu.be" in host:
             return "watch?v=" in link or "/shorts/" in parsed.path
 
-        # 其他站点放行，后续可扩展
-        return True
+        # 额外过滤：仅允许在 DOMAINS 列表中出现的域名（或其子域）
+        allowed_tokens = self._build_allowed_domain_tokens()
+        def host_matches_token(h: str, token: str) -> bool:
+            # token 可能为 .edu 或 example.com
+            if token.startswith('.'):
+                return h.endswith(token)
+            if h == token:
+                return True
+            return h.endswith('.' + token)
+
+        for tok in allowed_tokens:
+            if host_matches_token(host, tok):
+                return True
+
+        logger.debug("  链接域名不在 DOMAINS 白名单中: %s | allowed_tokens=%s", host, allowed_tokens)
+        return False

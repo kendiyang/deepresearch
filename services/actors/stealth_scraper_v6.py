@@ -143,21 +143,20 @@ class StealthScraper:
         self.parser = UniversalParser()
 
     def _get_filename(self, url: str, content_type: str) -> str:
-        """根据 URL 和 Content-Type 生成唯一文件名"""
-        # 1. 尝试从 URL 获取扩展名
+        """直接用 URL 最后一级文件名命名，如无则用 md5+扩展名兜底"""
         parsed = urlparse(url)
         path = parsed.path
-        ext = os.path.splitext(path)[1]
-        
-        # 2. 如果 URL 没后缀，从 Content-Type 猜
-        if not ext:
-            ext = mimetypes.guess_extension(content_type.split(";")[0].strip())
-            if not ext:
-                ext = ".bin" # 兜底
-
-        # 3. 使用 MD5 哈希生成文件名，避免特殊字符和文件名过长
+        basename = os.path.basename(path)
+        ext = os.path.splitext(basename)[1]
+        # 如果 basename 存在且有扩展名，直接用
+        if basename and ext:
+            return basename
+        # 否则用 md5+扩展名兜底
+        ext_guess = mimetypes.guess_extension(content_type.split(";")[0].strip())
+        if not ext_guess:
+            ext_guess = ".bin"
         file_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-        return f"{file_hash}{ext}"
+        return f"{file_hash}{ext_guess}"
 
     async def _save_binary(self, content: bytes, url: str, content_type: str) -> Dict:
         """保存二进制文件到本地"""

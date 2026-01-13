@@ -1,41 +1,107 @@
-from curl_cffi import requests
+import urllib
+import socks
+import http.client
+import logging
+import traceback
+from urllib.error import URLError
+import ssl
+from urllib.request import build_opener, HTTPHandler, HTTPSHandler
 
-def scrape_forbes_article():
-    target_url = "https://medium.com/scrub-me-secrets-the-blog/10-facial-products-for-sensitive-skin-bd6162354a0f"
-    
-    # 策略关键点：
-    # 1. 使用较新的 Chrome 指纹 (chrome120)
-    # 2. 必须携带完整的 User-Agent 和 Accept 头，模拟真实浏览行为
-    # 3. 启用 follow_redirects，因为 Forbes 可能会有跳转
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",  # 伪造来源，增加可信度
-        "Upgrade-Insecure-Requests": "1"
-    }
+# logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logger = logging.getLogger(__name__)
 
-    try:
-        # impersonate="chrome120" 是过 Forbes WAF 的核心
-        response = requests.get(
-            target_url,
-            impersonate="chrome120", 
-            headers=headers,
-            timeout=15
-        )
-        
-        if response.status_code == 200:
-            print(f"✅ 成功绕过检测 | 状态码: {response.status_code}")
-            print(f"页面标题片段: {response.text[:200].split('<title>')[1].split('</title>')[0]}")
-            
-            # 这里你可以接着用 BeautifulSoup 解析 response.text
-            # 提取具体的 beauty and wellness products 列表
-        else:
-            print(f"❌ 访问受限 | 状态码: {response.status_code}")
-            
-    except Exception as e:
-        print(f"发生错误: {e}")
+def merge_dict(a, b):
+    d = a.copy()
+    d.update(b)
+    return d
 
-if __name__ == "__main__":
-    scrape_forbes_article()
+class SocksiPyConnection(http.client.HTTPConnection):
+    def __init__(self, proxytype, proxyaddr, proxyport=None, rdns=True, username=None, password=None, *args, **kwargs):
+        self.proxyargs = (proxytype, proxyaddr, proxyport, rdns, username, password)
+        http.client.HTTPConnection.__init__(self, *args, **kwargs)
+
+    def connect(self):
+        logger.debug("SocksiPyConnection.connect: host=%s port=%s proxyargs=%s timeout=%s", self.host, self.port, self.proxyargs, getattr(self, 'timeout', None))
+        try:
+            self.sock = socks.socksocket()
+            self.sock.setproxy(*self.proxyargs)
+            if type(self.timeout) in (int, float):
+                self.sock.settimeout(self.timeout)
+            self.sock.connect((self.host, self.port))
+            logger.debug("SocksiPyConnection: connected socket to %s:%s", self.host, self.port)
+        except Exception as e:
+            logger.exception("SocksiPyConnection.connect failed: %s", e)
+            raise
+
+class SocksiPyConnectionS(http.client.HTTPSConnection):
+    def __init__(self, proxytype, proxyaddr, proxyport=None, rdns=True, username=None, password=None, *args, **kwargs):
+        self.proxyargs = (proxytype, proxyaddr, proxyport, rdns, username, password)
+        http.client.HTTPSConnection.__init__(self, *args, **kwargs)
+
+    def connect(self):
+        logger.debug("SocksiPyConnectionS.connect: host=%s port=%s proxyargs=%s timeout=%s", self.host, self.port, self.proxyargs, getattr(self, 'timeout', None))
+        try:
+            sock = socks.socksocket()
+            sock.setproxy(*self.proxyargs)
+            if type(self.timeout) in (int, float):
+                sock.settimeout(self.timeout)
+            sock.connect((self.host, self.port))
+            logger.debug("SocksiPyConnectionS: TCP connected, wrapping SSL")
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file)
+            logger.debug("SocksiPyConnectionS: SSL wrap complete")
+        except Exception as e:
+            logger.exception("SocksiPyConnectionS.connect failed: %s", e)
+            raise
+
+class SocksiPyHandler(HTTPHandler, HTTPSHandler):
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kw = kwargs
+        HTTPHandler.__init__(self)
+        HTTPSHandler.__init__(self)
+        # ensure attribute expected by HTTPSHandler / urllib
+        self._context = None
+        logger.debug("SocksiPyHandler init args=%s kwargs=%s", args, kwargs)
+
+    def http_open(self, req):
+        logger.debug("http_open called for %s", req.full_url)
+        def build(host, port=None, timeout=0, **kwargs):
+            kw = merge_dict(self.kw, kwargs)
+            conn = SocksiPyConnection(*self.args, host=host, port=port, timeout=timeout, **kw)
+            return conn
+
+        return self.do_open(build, req)
+    def https_open(self, req):
+        logger.debug("https_open called for %s", req.full_url)
+        def build(host, port=None, timeout=0, **kwargs):
+            kw = merge_dict(self.kw, kwargs)
+            conn = SocksiPyConnectionS(*self.args, host=host, port=port, timeout=timeout, **kw)
+            return conn
+
+        return self.do_open(build, req)
+
+username = "DAVTUCTN"
+password = "SEASA8HJ"
+ip = "107.150.104.94"
+port = 1558
+proxy = "socks5://{username}:{password}@{ip}:{port}".format(username=username, password=password, ip=ip, port=port)
+# socks.set_default_proxy(socks.SOCKS5, ip, port,username=username,password=password)
+# socket.socket = socks.socksocket
+
+url = 'https://mayips.com/'
+
+try:
+    req = urllib.request.Request(url=url, headers={'User-Agent':'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36'})
+    opener = build_opener(SocksiPyHandler(socks.SOCKS5, ip, port, username=username, password=password))
+    logger.debug("Opening URL via SOCKS proxy: %s", url)
+    response = opener.open(req)
+    body = response.read().decode('utf-8')
+    logger.debug("Response received, length=%d", len(body))
+    print(body)
+except URLError as e:
+    logger.exception("URLError during opener.open: %s", e)
+    print(e)
+except Exception as e:
+    logger.exception("Unexpected exception during request: %s", e)
+    traceback.print_exc()

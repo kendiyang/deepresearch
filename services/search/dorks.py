@@ -203,6 +203,31 @@ class EnterpriseDorkGenerator:
             "filetype:pdf"
         ]
         </Example 4>
+
+        <Example 5: The Translation Trap (Consumer vs. Science)>
+        Input: "乳香精油对皮肤紧致的科学依据"
+        Thinking:
+        - Subject: Frankincense Essential Oil.
+        - Intent: Scientific Validation (Mechanism of action).
+        - Domain Context:
+            - Consumer Context: "Firming", "Anti-wrinkle", "Face oil".
+            - Academic Context (Need Translation): "Frankincense" -> "Boswellia serrata"; "Firming" -> "Fibroblast migration", "Collagen", "Elastin", "Wound healing".
+        Decision:
+        - Categories: [
+            "Academic & Medical Research",
+            "Specific File Types & Institutional Search"
+        ]
+        - Keywords_EN: ["Boswellia serrata topical", "boswellic acids skin", "dermal fibrosis mechanism"]
+        - Platforms: [
+            "site:pubmed.ncbi.nlm.nih.gov",
+            "filetype:pdf site:.edu"
+        ]
+        Generated Dorks:
+            1. site:pubmed.ncbi.nlm.nih.gov (Boswellia OR "Frankincense oil") (fibroblast OR collagen OR elastin)
+            2. filetype:pdf site:.edu "Boswellia serrata" ("dermal" OR "cutaneous") (efficacy OR clinical)
+            3. filetype:pdf site:.gov "essential oils" (safety OR toxicity OR "dermatological")
+        </Example 5>
+
         """
 
         # ==============================================================================
@@ -213,8 +238,10 @@ class EnterpriseDorkGenerator:
         You are the **Head of Research Strategy** at an elite intelligence firm.
         Your goal is to route the user's research topic to the strictly correct **Internet Domain** and translate it into high-precision English search keywords.
         
-        # Context
-        Available Diversified Sources (pick from these):
+        # Context (Strict Whitelist)
+        You are functionally restricted. You may ONLY generate search queries using the domains explicitly defined in the dataset below. Use of any domain not present in this JSON is strictly prohibited.
+
+        Allowed Sources:
         {json.dumps(DOMAINS, indent=2)}
 
         # Reference Examples (Study these carefully!)
@@ -222,27 +249,37 @@ class EnterpriseDorkGenerator:
 
         
         # Strategy:
-        1. **Multi-Source Coverage:** Generate dorks across DIFFERENT PLATFORMS (not all from one site).
+        1.**Strict Mapping:** Check the user's topic against the 'category' and 'description' in the JSON. Even if you know a better external site, you MUST convert the intent to fit one of the Allowed Sources (e.g., use Reddit or generic News if a specific niche forum is missing).
+        2. **Multi-Source Coverage:** Generate dorks across DIFFERENT PLATFORMS (not all from one site).
            - Example pattern: 2-3 dorks from reddit.com, 2-3 from news sites, 2 from commerce, etc.
-        2. **Keyword Angles:** Vary the keywords to capture:
+        3. **Domain-Specific Vocabulary Mapping (CRITICAL):**
+           - **Consumer Context (Social/News/Blogs):** Use colloquial, emotional, and marketing keywords.
+             * Keywords: "skin firming", "magic serum", "wrinkle eraser", "breakout".
+           - **Academic/Technical Context (.edu, .gov, PubMed):** You MUST translate consumer terms into Scientific mechanisms or Chemical names.
+             * Keywords: "skin firming" → "(collagen synthesis OR fibroblast proliferation OR elasticity)"
+             * Keywords: "Frankincense" → "(Boswellia serrata OR Boswellic acids)"
+             * Keywords: "Anti-aging" → "(photoaging OR oxidative stress)"
+        4. **Keyword Angles:** Vary the keywords to capture:
            - Consumer sentiment (viral, controversy, overrated, worth it)
            - Trend forecasts (upcoming, next big thing, future of, latest trends)
            - Pain points (issue, fail, problem, regret, side effect)
            - Insider insights (behind the scenes, strategy, marketing)
-        3. **Syntax Rules:**
-           - Use `site:` for platform targeting
-           - NEVER use hardcoded years (e.g., 2021, 2022, 2023, 2024) inside the query text unless they represent the Current Year ({today.isoformat()}) or Previous Year ({one_year_ago_str}). Instead, rely primarily on the after:YYYY-MM-DD syntax for filtering.
-           - Only add `filetype:pdf` for academic/enterprise sources (.edu, .gov, reports)
-           - DO NOT use `filetype:pdf` for social media
-        4. **Anti-Noise:**
+        5. **Syntax Rules:**
+           - Use `site:` for platform targeting.
+           - **For Academic/PDF Dorks (Optimization):** * STRICTLY REMOVE filler words (e.g., "study", "report"). 
+             * USE Boolean Logic: `(ScientificTermA OR SynonymB) (MechanismA OR MechanismB)`.
+           - **Filetype Constraints:** You are STRICTLY PROHIBITED from adding filetype:pdf to any domain unless the string "filetype:pdf" is explicitly part of the site field in the JSON (e.g., do not combine site:.edu with filetype:pdf dynamically). **NEVER** use it for Social Media.
+           - **Date Logic:** * NEVER use hardcoded years (e.g., 2022) in the query text.
+             * **Default Recency Rule:** If the user input does NOT specify a timeframe, **ALWAYS** append `after:{one_year_ago_str}` to ensure data freshness.
+        6. **Anti-Noise:**
            - B2B/Tech: `-jobs -hiring -courses` (max 3 filters)
            - B2C: `-coupon -code -discount` (max 3 filters)
            - Social: Don't add noise filters; let the platform's algorithm work
-        5. **Avoid Long Exact Matches:**
+        7. **Avoid Long Exact Matches:**
            - Bad: `site:reddit.com "very specific long phrase about skincare marketing trends"`
            - Good: `site:reddit.com skincare (trends OR viral OR forecast) after:{one_year_ago_str}`
         
-        Output exactly at least 10 dorks, ensuring they span different sources and perspectives.
+        Generate **up to 10 dorks**. Prioritize strict adherence to the Allowed Sources over quantity. If valid sources are exhausted, stop generating.
 
        
 
