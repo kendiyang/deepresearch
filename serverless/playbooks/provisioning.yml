@@ -1,0 +1,135 @@
+---
+- name: Provision Steel Browser Container
+  hosts: docker_containers
+  gather_facts: yes
+  vars:
+    ansible_remote_tmp: /tmp
+    repo_url: "https://github.com/steel-dev/steel-browser.git"
+    app_dir: "/app"
+    # 定义全局环境变量
+    global_env:
+      NODE_ENV: "production"
+      PUPPETEER_CACHE_DIR: "/app/.cache"
+      DISPLAY: ":10"
+      CHROME_BIN: "/usr/bin/chromium"
+      CHROME_PATH: "/usr/bin/chromium"
+      PATH: "/usr/bin:/app/selenium/driver:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  tasks:
+    # --- 1. 系统基础配置 ---
+    - name: Update APT and Install Build Tools
+      raw: apt-get update && apt-get install -y git build-essential pkg-config xvfb
+      # 使用 raw 模块确保即使 python-apt 还没装好也能运行，虽然 Dockerfile 里装了
+
+    - name: Install Runtime Dependencies (Chrome, Java, Nginx)
+      apt:
+        name:
+          - chromium
+          - chromium-driver
+          - nginx
+          - default-jre
+          - libxss1
+          - dbus
+          - dbus-x11
+          - fonts-ipafont-gothic
+          - fonts-wqy-zenhei
+          - fonts-thai-tlwg
+          - fonts-kacst
+          - fonts-freefont-ttf
+          - curl
+          - unzip
+          - procps
+          - x11-xserver-utils
+        state: present
+        update_cache: yes
+        install_recommends: no
+
+    - name: Create Directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "/files"
+
+    # --- 2. 源码管理 ---
+    - name: Clone Repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: main
+        force: yes
+    
+    - name: Ensure Cache Directory Exists
+      file:
+        path: "{{ app_dir }}/.cache"
+        state: directory
+        mode: '0755'
+
+    - name: Debug paths
+      debug:
+        msg: 
+          - "Magic playbook_dir is: {{ playbook_dir }}"
+          - "Looking for file at: {{ playbook_dir }}/.env"
+
+    - name: Copy .env to /app/.env
+      copy:
+        src: "{{ playbook_dir }}/.env"
+        dest: "/app/.env"
+        mode: '0644'
+
+    # --- 3. 构建过程 ---
+    - name: Disable Husky
+      command: npm pkg set scripts.prepare="echo skip husky"
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Install & Build API
+      shell: |
+        npm ci --include=dev --workspace=api
+        npm run build -w api
+        npm prune --omit=dev -w api
+      args:
+        chdir: "{{ app_dir }}"
+      environment: "{{ global_env }}"
+
+    - name: Install & Build Recorder Extension
+      shell: |
+        npm ci --include=dev
+        npm run build
+        npm prune --omit=dev
+      args:
+        chdir: "{{ app_dir }}/api/extensions/recorder"
+      environment: "{{ global_env }}"
+
+    - name: Gather Facts (to get ansible_env)
+      setup:
+        filter: ansible_env
+
+    # --- 4. 环境持久化与收尾 ---
+    - name: Persist Environment Variables
+      blockinfile:
+        path: /etc/environment
+        create: yes
+        block: |
+          NODE_ENV="production"
+          PUPPETEER_CACHE_DIR="/app/.cache"
+          DISPLAY=":10"
+          CHROME_BIN="/usr/bin/chromium"
+          CHROME_PATH="/usr/bin/chromium"
+          HOST_IP="localhost"
+          DBUS_SESSION_BUS_ADDRESS="autolaunch:"
+          PATH="/usr/bin:/app/selenium/driver:{{ ansible_env.PATH }}"
+
+    - name: Ensure Entrypoint is Executable
+      file:
+        path: "{{ app_dir }}/api/entrypoint.sh"
+        mode: '0755'
+
+    # --- 5. 触发切换 ---
+    - name: Signal Wrapper to Switch Process
+      file:
+        path: /tmp/provision_complete
+        state: touch
+        mode: '0644'
+    

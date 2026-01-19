@@ -64,3 +64,6 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+
+services/crawlee/node_modules
+services/crawlee/dist

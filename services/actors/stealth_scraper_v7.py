@@ -9,15 +9,19 @@ import uuid
 import mimetypes
 import hashlib
 import re
+import time
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple, Literal
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional, Tuple, Literal, Set
 from urllib.parse import urlparse, urlencode, urlunparse
+from contextlib import asynccontextmanager
 
 # --- 第三方库 ---
 import aiofiles
-import aiosqlite
-from bs4 import BeautifulSoup
+import asyncpg
+import trafilatura
+# 显式导入 extract_metadata，防止版本差异导致的引用错误
+from trafilatura import extract, extract_metadata 
 from curl_cffi.requests import AsyncSession, RequestsError
 from aiobotocore.session import get_session
 
@@ -25,21 +29,19 @@ from aiobotocore.session import get_session
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
-# 选装 Trafilatura
-try:
-    import trafilatura
-    HAS_TRAFILATURA = True
-except ImportError:
-    HAS_TRAFILATURA = False
-
-# ================= 1. 深度配置层 (Configuration) =================
+# ================= 1. 配置层 (Configuration) =================
 class AppConfig(BaseSettings):
-    APP_NAME: str = "HybridScraper"
+    APP_NAME: str = "EnterpriseScraper"
     DATA_DIR: str = "./data"
-    DB_NAME: str = "task_queue.db"
     
+    # 存储设置
     STORAGE_TYPE: Literal["local", "s3"] = Field(default="local")
     
+    # PostgreSQL 配置
+    PG_DSN: str = "postgresql://tenmuses:tenmuses_dev@localhost:5432/tenmuses"
+    PG_MIN_SIZE: int = 5
+    PG_MAX_SIZE: int = 20
+
     # S3 / MinIO (可选)
     S3_ENDPOINT_URL: Optional[str] = "http://localhost:9000"
     S3_ACCESS_KEY: Optional[str] = "minioadmin"
@@ -49,17 +51,18 @@ class AppConfig(BaseSettings):
     S3_BATCH_SIZE: int = 50
     
     # 爬虫行为
-    MAX_CONCURRENCY: int = 5
+    MAX_CONCURRENCY: int = 5 # 建议先调低并发调试
     MAX_RETRIES: int = 3
-    REQUEST_TIMEOUT: int = 60      
-    # 代理列表 (示例) - 如果没有有效代理，建议设为空列表 []
-    PROXY_LIST: List[str] = ["http://127.0.0.1:1080"]      
+    REQUEST_TIMEOUT: int = 30
+    
+    # 代理池配置
+    PROXY_LIST: List[str] = [
+        "http://127.0.0.1:1080"
+    ]
+    PROXY_COOLDOWN_SECONDS: int = 300
+    PROXY_MAX_FAILURES: int = 5
 
-    model_config = SettingsConfigDict(
-        env_prefix="CRAWLER_",
-        env_file=".env",
-        extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_prefix="CRAWLER_", env_file=".env", extra="ignore")
 
 CONFIG = AppConfig()
 
@@ -80,111 +83,133 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(JsonFormatter())
 logger.addHandler(handler)
 
-# ================= 2. 平台专用处理器 (Reddit & TikTok) =================
+# ================= 2. 智能代理池管理 =================
+class ProxyManager:
+    def __init__(self, proxies: List[str]):
+        self.proxies = proxies
+        self._stats: Dict[str, Dict] = {p: {"failures": 0, "cooldown_until": 0} for p in proxies}
+        self._lock = asyncio.Lock()
+
+    async def get_proxy(self) -> Optional[str]:
+        async with self._lock:
+            now = time.time()
+            candidates = []
+            
+            for p in self.proxies:
+                stats = self._stats[p]
+                # 检查冷却时间
+                if stats["cooldown_until"] > now:
+                    continue 
+                candidates.append(p)
+            
+            if not candidates:
+                logger.warning("⚠️ All proxies are in cooldown or unavailable!")
+                return None # 明确返回 None
+
+            return random.choice(candidates)
+
+    async def report_status(self, proxy: str, status_code: int):
+        if not proxy: return
+        
+        async with self._lock:
+            stats = self._stats.get(proxy)
+            if not stats: return
+
+            # 严重错误：403, 429, 407 (Proxy Auth Required)
+            if status_code in [429, 403, 407]:
+                logger.warning(f"🚫 Proxy {proxy} blocked ({status_code}). Cooling down for {CONFIG.PROXY_COOLDOWN_SECONDS}s.")
+                stats["cooldown_until"] = time.time() + CONFIG.PROXY_COOLDOWN_SECONDS
+                stats["failures"] += 1
+            
+            elif status_code == 200:
+                stats["failures"] = 0
+            
+            elif status_code == 0 or status_code >= 500:
+                stats["failures"] += 1
+                if stats["failures"] >= CONFIG.PROXY_MAX_FAILURES:
+                     logger.warning(f"⚠️ Proxy {proxy} unstable. Cooling down.")
+                     stats["cooldown_until"] = time.time() + 60
+                     stats["failures"] = 0
+
+# ================= 3. 平台解析器 =================
 
 class RedditHandler:
     @staticmethod
     def convert_to_api_url(url: str) -> str:
-        """
-        将普通 Reddit URL 转换为 JSON API URL
-        确保 .json 添加在路径末尾，且不破坏 Query 参数
-        """
         parsed = urlparse(url)
-        if parsed.path.endswith(".json"):
-            return url
-        
-        # 去除尾部斜杠
+        if parsed.path.endswith(".json"): return url
         clean_path = parsed.path.rstrip("/")
-        # 添加 .json
         new_path = f"{clean_path}.json"
-        
-        # 重组 URL
-        return urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            new_path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
+        return urlunparse((parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
 
     @staticmethod
-    def parse_response(data: Dict, original_url: str) -> Dict:
-        """解析 Reddit JSON 响应"""
-        try:
-            content_type = "reddit_listing"
-            extracted_data = {}
+    def parse_response(data: Dict, original_url: str) -> Tuple[Dict, List[str]]:
+        new_tasks = []
+        parsed_data = {}
+        content_type = "reddit_unknown"
 
-            # 情况 A: 详情页 (返回列表: [Post, Comments])
+        try:
             if isinstance(data, list) and len(data) > 0:
                 content_type = "reddit_post_detail"
                 post_data = data[0].get('data', {}).get('children', [{}])[0].get('data', {})
                 comments_data = data[1].get('data', {}).get('children', []) if len(data) > 1 else []
                 
-                extracted_data = {
+                parsed_data = {
+                    "id": post_data.get("id"),
                     "title": post_data.get("title"),
                     "selftext": post_data.get("selftext"),
                     "author": post_data.get("author"),
                     "ups": post_data.get("ups"),
-                    "upvote_ratio": post_data.get("upvote_ratio"),
-                    "comment_count": post_data.get("num_comments"),
                     "created_utc": post_data.get("created_utc"),
-                    "top_comments": [c['data'].get('body') for c in comments_data[:3] if 'body' in c.get('data', {})]
+                    "comments": [c['data'].get('body') for c in comments_data[:5] if 'body' in c.get('data', {})]
                 }
             
-            # 情况 B: 列表页 (Subreddit Listing)
             elif isinstance(data, dict):
-                children = data.get("data", {}).get("children", [])
-                extracted_data = {
-                    "post_count": len(children),
-                    "posts": [
-                        {
-                            "title": c['data'].get('title'),
-                            "url": c['data'].get('url')
-                        } 
-                        for c in children[:5]
-                    ]
-                }
+                content_type = "reddit_listing"
+                d = data.get("data", {})
+                children = d.get("children", [])
+                
+                posts = []
+                for c in children:
+                    p_data = c.get('data', {})
+                    posts.append({
+                        "id": p_data.get("id"),
+                        "title": p_data.get("title"),
+                        "url": p_data.get("url"),
+                        "permalink": f"https://www.reddit.com{p_data.get('permalink')}"
+                    })
+
+                parsed_data = {"post_count": len(posts), "posts": posts}
+
+                after_cursor = d.get("after")
+                if after_cursor:
+                    base_parsed = urlparse(original_url)
+                    query_params = {k: v for k, v in [p.split('=') for p in base_parsed.query.split('&') if '=' in p]}
+                    query_params['after'] = after_cursor
+                    next_page_query = urlencode(query_params)
+                    next_page_url = urlunparse((
+                        base_parsed.scheme, base_parsed.netloc, base_parsed.path,
+                        base_parsed.params, next_page_query, base_parsed.fragment
+                    ))
+                    new_tasks.append(next_page_url)
+                    logger.info(f"📄 Found next page: {after_cursor}")
 
             return {
                 "url": original_url,
                 "platform": "reddit",
                 "type": content_type,
-                "parsed": extracted_data,
-                "raw_json": data, 
-                "timestamp": datetime.now().isoformat()
-            }
+                "data": parsed_data,
+                "ts": datetime.now().isoformat()
+            }, new_tasks
+
         except Exception as e:
-            return {"url": original_url, "error": str(e), "raw_partial": str(data)[:200]}
+            logger.error(f"Reddit Parse Error: {e}")
+            return {"url": original_url, "error": str(e)}, []
 
-class TikTokHandler:
-    @staticmethod
-    def extract_data(html: str, url: str) -> Optional[Dict]:
-        pattern = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">([^<]+)</script>', html)
-        if not pattern:
-            pattern = re.search(r'<script id="SIGI_STATE" type="application/json">([^<]+)</script>', html)
-        
-        if pattern:
-            try:
-                raw_data = json.loads(pattern.group(1))
-                return {
-                    "url": url,
-                    "platform": "tiktok",
-                    "type": "video_meta",
-                    "raw_data": raw_data,
-                    "timestamp": datetime.now().isoformat()
-                }
-            except:
-                pass
-        return None
-
-# ================= 3. 存储抽象层 (Storage Layer) =================
-
+# ================= 4. 存储层 =================
 class StorageBackend(ABC):
     @abstractmethod
     async def initialize(self): pass
-    @abstractmethod
-    async def save_asset(self, content: bytes, filename: str, content_type: str) -> str: pass
     @abstractmethod
     async def save_data(self, record: Dict): pass
     @abstractmethod
@@ -193,20 +218,12 @@ class StorageBackend(ABC):
 class LocalStorage(StorageBackend):
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
-        self.downloads_dir = os.path.join(base_dir, "downloads")
         self.data_file = os.path.join(base_dir, "scraped_data.jsonl")
         self._file_handle = None
 
     async def initialize(self):
-        os.makedirs(self.downloads_dir, exist_ok=True)
+        os.makedirs(self.base_dir, exist_ok=True)
         self._file_handle = await aiofiles.open(self.data_file, mode='a', encoding='utf-8', buffering=1)
-        logger.info(f"💾 Local Storage initialized at {self.base_dir}")
-
-    async def save_asset(self, content: bytes, filename: str, content_type: str) -> str:
-        filepath = os.path.join(self.downloads_dir, filename)
-        async with aiofiles.open(filepath, 'wb') as f:
-            await f.write(content)
-        return filepath
 
     async def save_data(self, record: Dict):
         if self._file_handle:
@@ -214,282 +231,210 @@ class LocalStorage(StorageBackend):
             await self._file_handle.flush()
 
     async def close(self):
-        if self._file_handle:
-            await self._file_handle.close()
+        if self._file_handle: await self._file_handle.close()
 
-class S3Storage(StorageBackend):
+# ================= 5. PostgreSQL 任务管理器 =================
+class PGTaskManager:
     def __init__(self):
-        self.session = get_session()
-        self.client = None
-        self.bucket = CONFIG.S3_BUCKET_NAME
-        self.buffer = []
-
-    async def initialize(self):
-        self.client = await self.session.create_client(
-            's3', endpoint_url=CONFIG.S3_ENDPOINT_URL,
-            aws_access_key_id=CONFIG.S3_ACCESS_KEY,
-            aws_secret_access_key=CONFIG.S3_SECRET_KEY,
-            region_name=CONFIG.S3_REGION_NAME
-        ).__aenter__()
-        logger.info("☁️ S3 Storage initialized")
-
-    async def save_asset(self, content: bytes, filename: str, content_type: str) -> str:
-        key = f"assets/{filename}"
-        await self.client.put_object(Bucket=self.bucket, Key=key, Body=content, ContentType=content_type)
-        return f"s3://{self.bucket}/{key}"
-
-    async def save_data(self, record: Dict):
-        self.buffer.append(record)
-        if len(self.buffer) >= CONFIG.S3_BATCH_SIZE:
-            await self._flush()
-
-    async def _flush(self):
-        if not self.buffer: return
-        data = list(self.buffer)
-        self.buffer.clear()
-        key = f"data/{uuid.uuid4().hex}.jsonl"
-        body = "\n".join([json.dumps(r, ensure_ascii=False) for r in data]).encode('utf-8')
-        await self.client.put_object(Bucket=self.bucket, Key=key, Body=body)
-
-    async def close(self):
-        await self._flush()
-        if self.client: await self.client.__aexit__(None, None, None)
-
-# ================= 4. 数据持久层 (DB) =================
-class TaskManager:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._db = None
-        self._lock = asyncio.Lock()
+        self.pool: Optional[asyncpg.Pool] = None
 
     async def init_db(self):
-        self._db = await aiosqlite.connect(self.db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL;")
-        await self._db.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                url TEXT PRIMARY KEY,
-                status TEXT DEFAULT 'PENDING',
-                retry_count INTEGER DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await self._db.commit()
+        self.pool = await asyncpg.create_pool(
+            dsn=CONFIG.PG_DSN,
+            min_size=CONFIG.PG_MIN_SIZE,
+            max_size=CONFIG.PG_MAX_SIZE
+        )
+        
+        ddl = """
+        CREATE TABLE IF NOT EXISTS tasks (
+            url_hash TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            status VARCHAR(20) DEFAULT 'PENDING',
+            retry_count INT DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_status_retry ON tasks(status, retry_count);
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(ddl)
+        logger.info("🐘 PostgreSQL initialized.")
+
+    def _hash_url(self, url: str) -> str:
+        return hashlib.md5(url.encode()).hexdigest()
 
     async def add_tasks(self, urls: List[str]):
         if not urls: return
-        async with self._lock:
-            await self._db.executemany(
-                "INSERT OR IGNORE INTO tasks (url) VALUES (?)", [(u,) for u in urls]
-            )
-            await self._db.commit()
+        query = """
+        INSERT INTO tasks (url_hash, url) VALUES ($1, $2)
+        ON CONFLICT (url_hash) DO NOTHING
+        """
+        async with self.pool.acquire() as conn:
+            records = [(self._hash_url(u), u) for u in urls]
+            await conn.executemany(query, records)
 
     async def acquire_task(self) -> Optional[Tuple[str, int]]:
-        # 获取待处理任务 (PENDING 或 失败次数未超限的 FAILED)
-        q = f"""
-            UPDATE tasks
-            SET status = 'PROCESSING', updated_at = CURRENT_TIMESTAMP
-            WHERE url = (
-                SELECT url FROM tasks 
-                WHERE status = 'PENDING' 
-                OR (status = 'FAILED' AND retry_count < ?)
-                LIMIT 1
-            )
-            RETURNING url, retry_count
+        query = f"""
+        WITH task_to_process AS (
+            SELECT url_hash, url, retry_count
+            FROM tasks
+            WHERE status = 'PENDING' 
+               OR (status = 'FAILED' AND retry_count < $1)
+            ORDER BY updated_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE tasks
+        SET status = 'PROCESSING', updated_at = NOW()
+        FROM task_to_process
+        WHERE tasks.url_hash = task_to_process.url_hash
+        RETURNING tasks.url, tasks.retry_count;
         """
-        async with self._lock:
-            try:
-                async with self._db.execute(q, (CONFIG.MAX_RETRIES,)) as cursor:
-                    row = await cursor.fetchone()
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, CONFIG.MAX_RETRIES)
                 if row:
-                    await self._db.commit()
-                    return row
+                    return row['url'], row['retry_count']
                 return None
-            except Exception as e:
-                logger.error(f"DB Acquire Error: {e}")
-                return None
+        except Exception as e:
+            logger.error(f"DB Acquire Error: {e}")
+            return None
 
-    async def update_task(self, url: str, status: str, fatal_error: bool = False):
-        async with self._lock:
-            if status == 'FAILED':
-                if fatal_error:
-                    # 如果是致命错误 (如 404)，直接将重试次数设为最大，防止再次提取
-                    await self._db.execute(
-                        "UPDATE tasks SET status=?, retry_count=999 WHERE url=?", 
-                        (status, url)
-                    )
-                else:
-                    await self._db.execute(
-                        "UPDATE tasks SET status=?, retry_count=retry_count+1 WHERE url=?", 
-                        (status, url)
-                    )
+    async def update_task(self, url: str, status: str, fatal: bool = False):
+        url_hash = self._hash_url(url)
+        query = "UPDATE tasks SET status=$1, updated_at=NOW() WHERE url_hash=$2"
+        params = [status, url_hash]
+        
+        if status == 'FAILED':
+            if fatal:
+                query = "UPDATE tasks SET status=$1, retry_count=999, updated_at=NOW() WHERE url_hash=$2"
             else:
-                await self._db.execute("UPDATE tasks SET status=? WHERE url=?", (status, url))
-            await self._db.commit()
+                query = "UPDATE tasks SET status=$1, retry_count=retry_count+1, updated_at=NOW() WHERE url_hash=$2"
+        
+        async with self.pool.acquire() as conn:
+            await conn.execute(query, *params)
 
     async def close(self):
-        if self._db: await self._db.close()
+        if self.pool: await self.pool.close()
 
-# ================= 5. 网络与解析层 (关键修改版) =================
+# ================= 6. 网络层 (修复) =================
 class NetworkEngine:
-    def __init__(self, storage: StorageBackend):
+    def __init__(self, storage: StorageBackend, db: PGTaskManager, proxy_mgr: ProxyManager):
         self.storage = storage
-        # 移除 safari，优先使用 chrome 系列以获得更好的 API 兼容性
-        self.impersonates = ["chrome120", "chrome124"]
-
-    def _is_reddit_url(self, url: str) -> bool:
-        return "reddit.com" in url
-
-    def _is_tiktok_url(self, url: str) -> bool:
-        return "tiktok.com" in url
+        self.db = db
+        self.proxy_mgr = proxy_mgr
+        # 修复：移除 safari17_2，使用更通用的 chrome 指纹
+        self.impersonates = ["chrome120", "chrome110", "edge101"]
 
     async def fetch_and_process(self, url: str) -> Literal["SUCCESS", "RETRY", "FATAL"]:
-        """
-        返回状态码:
-        SUCCESS: 成功
-        RETRY: 软错误 (超时, 5xx)
-        FATAL: 硬错误 (404, 权限拒绝) -> 不再重试
-        """
-        proxy = random.choice(CONFIG.PROXY_LIST) if CONFIG.PROXY_LIST else None
-        proxies = {"http": proxy, "https": proxy} if proxy else {}
+        proxy = await self.proxy_mgr.get_proxy()
+        
+        # 如果没有可用代理（全部冷却），等待并返回 RETRY，让 Worker 稍后处理
+        if not proxy and CONFIG.PROXY_LIST:
+            logger.warning("⏳ No healthy proxies available. Worker sleeping...")
+            await asyncio.sleep(5) 
+            return "RETRY"
 
+        proxies = {"http": proxy, "https": proxy} if proxy else {}
+        
         target_url = url
-        
-        # ⚠️ 关键修改 1: 不要手动设置 User-Agent，让 impersonate 自动处理
-        # 仅设置语言偏好，这不会破坏 TLS 指纹
-        headers = {
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        }
-        
-        if self._is_reddit_url(url):
+        is_reddit = "reddit.com" in url
+        if is_reddit:
             target_url = RedditHandler.convert_to_api_url(url)
-            # Reddit API 对 Content-Type 有时敏感
-            headers["Accept"] = "*/*"
+
+        headers = {"Accept-Language": "en-US,en;q=0.9"}
 
         try:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-
-            # ⚠️ 关键修改 2: impersonate 自动处理指纹
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            
             async with AsyncSession(
                 impersonate=random.choice(self.impersonates),
                 proxies=proxies,
                 headers=headers,
                 timeout=CONFIG.REQUEST_TIMEOUT
             ) as s:
-                
-                logger.debug(f"🔍 Requesting: {target_url}")
+                logger.debug(f"🔍 GET {target_url} | Proxy: {proxy}")
                 response = await s.get(target_url)
                 
-                # --- 404 处理 (Reddit 专用) ---
+                if response.status_code in [429, 403]:
+                    await self.proxy_mgr.report_status(proxy, response.status_code)
+                    logger.warning(f"🛡️ Rate Limited/Forbidden ({response.status_code}): {url}. Rotating proxy...")
+                    return "RETRY"
+                
                 if response.status_code == 404:
-                    logger.warning(f"⛔️ Resource Not Found (404): {target_url}")
-                    return "FATAL" # 致命错误，不重试
-
-                # --- 权限/速率限制处理 ---
-                if response.status_code in [403, 429]:
-                    logger.warning(f"⚠️ Access Denied/Rate Limit ({response.status_code}): {url}")
-                    return "RETRY"
-
+                    return "FATAL"
+                
                 if response.status_code != 200:
-                    logger.warning(f"⚠️ HTTP {response.status_code} - {url}")
+                    await self.proxy_mgr.report_status(proxy, response.status_code)
                     return "RETRY"
-                
-                # --- 成功响应处理 ---
-                
-                # 1. Reddit JSON
-                if self._is_reddit_url(url):
+
+                # 成功
+                await self.proxy_mgr.report_status(proxy, 200)
+
+                # 解析逻辑
+                if is_reddit:
                     try:
                         json_data = response.json()
-                        parsed = RedditHandler.parse_response(json_data, url)
+                        parsed, new_links = RedditHandler.parse_response(json_data, url)
                         await self.storage.save_data(parsed)
-                        logger.info(f"✅ Saved Reddit JSON: {url}")
+                        if new_links:
+                            await self.db.add_tasks(new_links)
+                            logger.info(f"🔄 Added {len(new_links)} pagination tasks")
                         return "SUCCESS"
                     except json.JSONDecodeError:
-                        logger.error(f"❌ Reddit returned non-JSON content for: {target_url}")
-                        # 如果 API 返回了 HTML (通常是 Cloudflare 盾)，则重试
                         return "RETRY"
 
                 content_type = response.headers.get("content-type", "").lower()
                 
-                # 2. TikTok Meta
-                if self._is_tiktok_url(url) and "text/html" in content_type:
-                    tiktok_data = TikTokHandler.extract_data(response.text, url)
-                    if tiktok_data:
-                        await self.storage.save_data(tiktok_data)
-                        logger.info(f"✅ Saved TikTok Meta: {url}")
-                        return "SUCCESS"
-                
-                # 3. 通用 HTML
                 if "text/html" in content_type:
-                    data = self._parse_html(response.text, url)
-                    await self.storage.save_data(data)
-                    logger.info(f"✅ Saved HTML: {url}")
-                
-                # 4. 通用文件下载
-                else:
-                    filename = self._get_filename(url, content_type)
-                    path = await self.storage.save_asset(response.content, filename, content_type)
-                    meta = {
-                        "url": url, "type": "asset", "path": path,
-                        "size": len(response.content), "ts": datetime.now().isoformat()
+                    # 修复：使用 trafilatura.extract 提取正文
+                    extracted_text = extract(
+                        response.text, 
+                        include_comments=False,
+                        include_tables=False,
+                        no_fallback=False
+                    )
+                    
+                    # 修复：使用 trafilatura.extract_metadata 提取元数据
+                    meta = extract_metadata(response.text)
+                    title = meta.title if meta else "No Title"
+                    
+                    if not extracted_text:
+                        logger.warning(f"⚠️ Trafilatura returned empty for {url}")
+                        
+                    data = {
+                        "url": url,
+                        "type": "html_article",
+                        "title": title,
+                        "content": extracted_text,
+                        "raw_length": len(response.text),
+                        "ts": datetime.now().isoformat()
                     }
-                    await self.storage.save_data(meta)
-                    logger.info(f"✅ Saved Asset: {filename}")
-                
+                    await self.storage.save_data(data)
+                    return "SUCCESS"
+
                 return "SUCCESS"
 
         except RequestsError as e:
+            await self.proxy_mgr.report_status(proxy, 0)
             logger.error(f"❌ Network Error {url}: {e}")
             return "RETRY"
         except Exception as e:
+            # 捕获其他系统错误 (如库版本问题)，防止 Worker 崩溃
             logger.error(f"❌ System Error {url}: {e}")
             return "RETRY"
 
-    def _parse_html(self, html: str, url: str) -> Dict:
-        soup = BeautifulSoup(html, "html.parser")
-        content = ""
-        if HAS_TRAFILATURA:
-            try:
-                content = trafilatura.extract(html, include_comments=False)
-            except: pass
-            
-        if not content:
-            paras = [p.get_text().strip() for p in soup.find_all("p")]
-            content = "\n".join([p for p in paras if len(p) > 20])
-
-        title = soup.title.string.strip() if soup.title else "No Title"
-        return {
-            "url": url,
-            "type": "html",
-            "title": title,
-            "content": content,
-            "timestamp": datetime.now().isoformat()
-        }
-
-    def _get_filename(self, url: str, content_type: str) -> str:
-        parsed = urlparse(url)
-        path = parsed.path
-        name = os.path.basename(path)
-        if not name or "." not in name:
-            ext = mimetypes.guess_extension(content_type.split(';')[0]) or ".bin"
-            hash_name = hashlib.md5(url.encode()).hexdigest()
-            name = f"{hash_name}{ext}"
-        return name
-
-# ================= 6. 主编排 (Orchestrator) =================
+# ================= 7. 主编排 =================
 class CrawlerEngine:
     def __init__(self):
-        if CONFIG.STORAGE_TYPE == "s3":
-            self.storage = S3Storage()
-        else:
-            self.storage = LocalStorage(CONFIG.DATA_DIR)
-            
-        self.db = TaskManager(os.path.join(CONFIG.DATA_DIR, CONFIG.DB_NAME))
-        self.network = NetworkEngine(self.storage)
+        self.storage = LocalStorage(CONFIG.DATA_DIR)
+        self.db = PGTaskManager()
+        self.proxy_mgr = ProxyManager(CONFIG.PROXY_LIST)
+        self.network = NetworkEngine(self.storage, self.db, self.proxy_mgr)
         self.shutdown_event = asyncio.Event()
 
     async def worker(self, worker_id: int):
-        logger.info(f"👷 Worker-{worker_id} ready")
+        logger.info(f"👷 Worker-{worker_id} started")
         while not self.shutdown_event.is_set():
             try:
                 task = await self.db.acquire_task()
@@ -498,76 +443,57 @@ class CrawlerEngine:
                     continue
                 
                 url, retry_cnt = task
-                logger.info(f"▶️ Worker-{worker_id} processing: {url} (Retry: {retry_cnt})")
+                logger.info(f"▶️ [{worker_id}] Processing: {url} (Try: {retry_cnt})")
                 
-                # 获取执行结果状态
                 status = await self.network.fetch_and_process(url)
                 
                 if status == "SUCCESS":
                     await self.db.update_task(url, "COMPLETED")
                 elif status == "FATAL":
-                    logger.error(f"💀 Worker-{worker_id} marking FATAL error for: {url}")
-                    await self.db.update_task(url, "FAILED", fatal_error=True)
-                else: # RETRY
-                    await self.db.update_task(url, "FAILED", fatal_error=False)
+                    await self.db.update_task(url, "FAILED", fatal=True)
+                else: 
+                    await self.db.update_task(url, "FAILED", fatal=False)
+                    await asyncio.sleep(1) # 失败后稍微冷却
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker-{worker_id} Loop Error: {e}")
+                logger.error(f"Worker Loop Error: {e}")
                 await asyncio.sleep(1)
 
     async def run(self, seeds: List[str]):
-        os.makedirs(CONFIG.DATA_DIR, exist_ok=True)
         await self.db.init_db()
-        await self.db.add_tasks(seeds)
         await self.storage.initialize()
+        await self.db.add_tasks(seeds)
         
         loop = asyncio.get_running_loop()
-        if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(signal.SIGINT, lambda: self.shutdown_event.set())
-                loop.add_signal_handler(signal.SIGTERM, lambda: self.shutdown_event.set())
-            except NotImplementedError:
-                pass
+                loop.add_signal_handler(sig, lambda: self.shutdown_event.set())
+            except NotImplementedError: pass
 
-        logger.info(f"🚀 Engine Started | Storage: {CONFIG.STORAGE_TYPE} | Workers: {CONFIG.MAX_CONCURRENCY}")
-        
+        logger.info(f"🚀 Engine Started with {CONFIG.MAX_CONCURRENCY} workers.")
         workers = [asyncio.create_task(self.worker(i)) for i in range(CONFIG.MAX_CONCURRENCY)]
         
         try:
             while not self.shutdown_event.is_set():
-                if all(w.done() for w in workers):
-                    break
+                if all(w.done() for w in workers): break
                 await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("🛑 Received Stop Signal")
-            self.shutdown_event.set()
         finally:
             self.shutdown_event.set()
-            logger.info("⏳ Shutting down workers...")
+            logger.info("⏳ Shutting down...")
             await asyncio.gather(*workers, return_exceptions=True)
             await self.db.close()
             await self.storage.close()
             logger.info("👋 Shutdown Complete.")
 
 if __name__ == "__main__":
-    # 测试种子
-    targets = [
-        "https://www.reddit.com/r/MachineLearning",
-        "https://www.reddit.com/r/beauty/comments/1ji1ppw/women_over_55_shoot_me_your_absolute_favorite",
-        "https://www.reddit.com/r/SkincareAddictionLux/comments/1m0gk6t/does_anyone_have_a_good_recommendation_for_a",
-        "https://www.reddit.com/r/SkincareAddictionLux/comments/1jd2mwd/antiaging_products_breakdown",
-        "https://www.reddit.com/r/SkincareAddictionLux/comments/1n6zafx/luxurious_chemo_skincare_routine",
-        "https://www.reddit.com/r/GracefulAgingSkincare/comments/1oyxdv3/would_love_to_hear_from_women_40_whats_actually",
-        "https://www.reddit.com/r/AsianBeauty/comments/1ia8hn8/retinol_vs_retinal_vs_bakuchiol"
+    seeds = [
+        "https://www.reddit.com/r/SkincareAddictionLux/comments/1kv7g3h/eye_serum_and_cream_recommendations",
     ]
-    
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
     engine = CrawlerEngine()
     try:
-        asyncio.run(engine.run(targets))
-    except KeyboardInterrupt:
-        pass
+        asyncio.run(engine.run(seeds))
+    except KeyboardInterrupt: pass

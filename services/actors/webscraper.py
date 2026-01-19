@@ -53,7 +53,7 @@ class AppConfig(BaseSettings):
     MAX_RETRIES: int = 3
     REQUEST_TIMEOUT: int = 60      
     # 代理列表 (示例) - 如果没有有效代理，建议设为空列表 []
-    PROXY_LIST: List[str] = ["http://127.0.0.1:1080"]      
+    PROXY_LIST: List[str] = ["http://5gye4972-region-SG:7fsccucj@us.novproxy.io:443"]      
 
     model_config = SettingsConfigDict(
         env_prefix="CRAWLER_",
@@ -554,13 +554,7 @@ class CrawlerEngine:
 if __name__ == "__main__":
     # 测试种子
     targets = [
-        "https://www.reddit.com/r/MachineLearning",
-        "https://www.reddit.com/r/beauty/comments/1ji1ppw/women_over_55_shoot_me_your_absolute_favorite",
-        "https://www.reddit.com/r/SkincareAddictionLux/comments/1m0gk6t/does_anyone_have_a_good_recommendation_for_a",
-        "https://www.reddit.com/r/SkincareAddictionLux/comments/1jd2mwd/antiaging_products_breakdown",
-        "https://www.reddit.com/r/SkincareAddictionLux/comments/1n6zafx/luxurious_chemo_skincare_routine",
-        "https://www.reddit.com/r/GracefulAgingSkincare/comments/1oyxdv3/would_love_to_hear_from_women_40_whats_actually",
-        "https://www.reddit.com/r/AsianBeauty/comments/1ia8hn8/retinol_vs_retinal_vs_bakuchiol"
+        "https://ie.trustpilot.com/review/theordinary.com?page=5"
     ]
     
     if sys.platform == 'win32':

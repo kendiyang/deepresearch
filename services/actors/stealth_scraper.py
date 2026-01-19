@@ -2,308 +2,511 @@ import asyncio
 import logging
 import json
 import random
-import re
 import os
-import hashlib
+import sys
+import signal
+import uuid
 import mimetypes
-import aiofiles
-from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import hashlib
+import re
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple, Literal
+from urllib.parse import urlparse, urlencode, urlunparse
 
 # --- 第三方库 ---
+import aiofiles
+import aiosqlite
 from bs4 import BeautifulSoup
-from curl_cffi.requests import AsyncSession
+from curl_cffi.requests import AsyncSession, RequestsError
+from aiobotocore.session import get_session
 
-# 尝试导入 trafilatura
+# Pydantic V2
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+# 选装 Trafilatura
 try:
     import trafilatura
     HAS_TRAFILATURA = True
 except ImportError:
     HAS_TRAFILATURA = False
 
-# ================= 配置区域 =================
-OUTPUT_FILE = "scraped_data.jsonl"
-DOWNLOAD_DIR = "downloads"  # 新增：文件保存目录
-PROXY_LIST = []             # 代理列表 ["http://u:p@ip:port"]
-MAX_CONCURRENCY = 3
-# ===========================================
-
-# 自动创建下载目录
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger("Scraper")
-
-class ProxyManager:
-    def __init__(self, proxies: List[str]):
-        self.proxies = proxies
+# ================= 1. 深度配置层 =================
+class AppConfig(BaseSettings):
+    APP_NAME: str = "HybridScraper_Pro"
+    DATA_DIR: str = "./data"
+    DB_NAME: str = "task_queue.db"
     
-    def get_proxy(self) -> Optional[str]:
-        return random.choice(self.proxies) if self.proxies else None
-
-class UniversalParser:
-    """通用解析器：负责从 HTML 中提取结构化数据"""
+    STORAGE_TYPE: Literal["local", "s3"] = Field(default="local")
     
-    def _clean_text(self, text: str) -> str:
-        if not text: return ""
-        return re.sub(r'\s+', ' ', text).strip()
+    S3_ENDPOINT_URL: Optional[str] = "http://localhost:9000"
+    S3_ACCESS_KEY: Optional[str] = "minioadmin"
+    S3_SECRET_KEY: Optional[str] = "minioadmin"
+    S3_BUCKET_NAME: str = "crawler-data"
+    S3_REGION_NAME: str = "us-east-1"
+    S3_BATCH_SIZE: int = 50
+    
+    # 策略配置
+    MAX_CONCURRENCY: int = 3       # Reddit 建议降低并发，避免封 IP 段
+    MAX_RETRIES: int = 5           # 增加重试次数
+    REQUEST_TIMEOUT: int = 30
+    
+    # 代理池 (建议使用轮换代理)
+    PROXY_LIST: List[str] = [
+        "http://5gye4972-region-US-sid-VP4v8Nsj-t-1:7fsccucj@us.novproxy.io:443",
+        "http://5gye4972-region-US-sid-cfDbzT2U-t-1:7fsccucj@us.novproxy.io:443",
+        "http://5gye4972-region-US-sid-Rr1DKxDS-t-1:7fsccucj@us.novproxy.io:443",
+        "http://5gye4972-region-US-sid-R7NdWqFN-t-1:7fsccucj@us.novproxy.io:443",
+        "http://5gye4972-region-US-sid-Vd1vYtdp-t-1:7fsccucj@us.novproxy.io:443"
+    ] 
 
-    def _extract_nextjs_data(self, soup: BeautifulSoup) -> Dict:
-        script = soup.find("script", id="__NEXT_DATA__", type="application/json")
-        if script:
-            try: return json.loads(script.string)
-            except: pass
-        return {}
+    model_config = SettingsConfigDict(
+        env_prefix="CRAWLER_",
+        env_file=".env",
+        extra="ignore"
+    )
 
-    def _recursive_find(self, data: Any, target_keys: List[str], results: List[Any]):
-        if isinstance(data, dict):
-            match = True
-            for k in target_keys:
-                if k not in data:
-                    match = False
-                    break
-            if match: results.append(data)
-            for v in data.values(): self._recursive_find(v, target_keys, results)
-        elif isinstance(data, list):
-            for item in data: self._recursive_find(item, target_keys, results)
+CONFIG = AppConfig()
 
-    def parse(self, html: str, url: str) -> Dict:
-        soup = BeautifulSoup(html, "html.parser")
-        domain = urlparse(url).netloc
-        
-        result = {
-            "url": url,
-            "domain": domain,
-            "type": "generic",
-            "title": "",
-            "content": "",
-            "reviews": [],
-            "total_pages": 0
+# 日志配置
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "lvl": record.levelname,
+            "msg": record.getMessage(),
+            "mod": record.module,
         }
+        return json.dumps(log_obj, ensure_ascii=False)
 
-        # 提取标题
-        if soup.title: result["title"] = self._clean_text(soup.title.string)
+logger = logging.getLogger(CONFIG.APP_NAME)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logger.addHandler(handler)
 
-        # 判断是否为 Trustpilot
-        if "trustpilot.com" in domain:
-            result["type"] = "review_platform"
-            next_data = self._extract_nextjs_data(soup)
-            if next_data:
-                # 提取评论
-                raw_reviews = []
-                self._recursive_find(next_data, ["reviewText", "rating"], raw_reviews)
-                if not raw_reviews:
-                    self._recursive_find(next_data, ["text", "rating"], raw_reviews)
-                
-                for item in raw_reviews:
-                    text = item.get("reviewText") or item.get("text")
-                    if text:
-                        result["reviews"].append({
-                            "rating": item.get("rating"),
-                            "text": text,
-                            "date": item.get("dates", {}).get("publishedDate")
-                        })
-                
-                # 提取分页
-                found_pages = []
-                def find_key(obj, key):
-                    if isinstance(obj, dict):
-                        if key in obj: found_pages.append(obj[key])
-                        for v in obj.values(): find_key(v, key)
-                    elif isinstance(obj, list):
-                        for i in obj: find_key(i, key)
-                find_key(next_data, "totalPages")
-                if found_pages:
-                    vals = [int(x) for x in found_pages if str(x).isdigit()]
-                    if vals: result["total_pages"] = max(vals)
+# ================= 2. 平台处理器 =================
 
-        else:
-            # 通用网页
-            result["type"] = "article/general"
-            if HAS_TRAFILATURA:
-                extracted = trafilatura.extract(html, include_comments=False)
-                if extracted: result["content"] = extracted
-            
-            if not result["content"]:
-                paras = [self._clean_text(p.get_text()) for p in soup.find_all("p")]
-                result["content"] = "\n\n".join([p for p in paras if len(p) > 30])
-
-        return result
-
-class StealthScraper:
-    """下载器：支持 HTML 解析与文件下载"""
-    def __init__(self, proxy_manager: ProxyManager):
-        self.proxy_manager = proxy_manager
-        self.impersonates = ["chrome120", "safari17_0", "chrome110"]
-        self.parser = UniversalParser()
-
-    def _get_filename(self, url: str, content_type: str) -> str:
-        """根据 URL 和 Content-Type 生成唯一文件名"""
-        # 1. 尝试从 URL 获取扩展名
+class RedditHandler:
+    @staticmethod
+    def optimize_url(url: str) -> str:
+        """
+        Reddit 核心破解逻辑：
+        1. 强制使用 old.reddit.com (鉴权最宽松)
+        2. 确保 .json 后缀
+        3. 清理无用参数
+        """
         parsed = urlparse(url)
-        path = parsed.path
-        ext = os.path.splitext(path)[1]
         
-        # 2. 如果 URL 没后缀，从 Content-Type 猜
-        if not ext:
-            ext = mimetypes.guess_extension(content_type.split(";")[0].strip())
-            if not ext:
-                ext = ".bin" # 兜底
-
-        # 3. 使用 MD5 哈希生成文件名，避免特殊字符和文件名过长
-        file_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-        return f"{file_hash}{ext}"
-
-    async def _save_binary(self, content: bytes, url: str, content_type: str) -> Dict:
-        """保存二进制文件到本地"""
-        filename = self._get_filename(url, content_type)
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
+        # 1. 强制替换域名为 old.reddit.com
+        new_netloc = "old.reddit.com"
         
-        async with aiofiles.open(filepath, 'wb') as f:
-            await f.write(content)
-        
-        logger.info(f"💾 文件已保存: {filename} ({len(content)/1024:.1f} KB)")
-        
-        return {
-            "url": url,
-            "type": "file",
-            "file_path": filepath,
-            "content_type": content_type,
-            "size_bytes": len(content)
-        }
-
-    async def fetch_and_process(self, url: str) -> Optional[Dict]:
-        """核心方法：请求 URL 并根据类型决定是解析还是下载"""
-        for attempt in range(3):
-            proxy = self.proxy_manager.get_proxy()
-            impersonate_ver = random.choice(self.impersonates)
+        # 2. 处理路径，确保以 .json 结尾
+        path = parsed.path.rstrip("/")
+        if not path.endswith(".json"):
+            path += ".json"
             
-            try:
-                await asyncio.sleep(random.uniform(1, 3))
+        return urlunparse((
+            parsed.scheme,
+            new_netloc,
+            path,
+            parsed.params,
+            parsed.query,  # 保留 sort=new 等参数
+            parsed.fragment
+        ))
+
+    @staticmethod
+    def parse_response(data: Dict, original_url: str) -> Dict:
+        """解析 Reddit JSON"""
+        try:
+            content_type = "reddit_listing"
+            extracted_data = {}
+
+            # 详情页结构: [PostData, CommentsData]
+            if isinstance(data, list) and len(data) > 0:
+                content_type = "reddit_post_detail"
+                post_container = data[0].get('data', {}).get('children', [{}])[0].get('data', {})
                 
-                async with AsyncSession(
-                    impersonate=impersonate_ver,
-                    headers={"Referer": "https://www.google.com/"},
-                    proxies={"http": proxy, "https": proxy} if proxy else None,
-                    timeout=45 # 下载文件可能需要更长时间
-                ) as session:
-                    response = await session.get(url)
-                    
-                    if response.status_code == 200:
-                        content_type = response.headers.get("content-type", "").lower()
-                        
-                        # --- 分支逻辑：文件 vs 网页 ---
-                        
-                        # 1. 如果是常见的文本格式，进行解析
-                        if "text/html" in content_type or "application/json" in content_type:
-                            return self.parser.parse(response.text, url)
-                        
-                        # 2. 否则视为文件 (PDF, Image, Zip, etc.) 进行下载
-                        else:
-                            return await self._save_binary(response.content, url, content_type)
+                # 评论处理
+                comments_data = []
+                if len(data) > 1:
+                    raw_comments = data[1].get('data', {}).get('children', [])
+                    for c in raw_comments[:10]: # 提取前10条
+                        if c.get('kind') == 't1': # t1 是评论
+                            comments_data.append({
+                                "author": c['data'].get('author'),
+                                "body": c['data'].get('body'),
+                                "ups": c['data'].get('ups')
+                            })
 
-                    elif response.status_code in [403, 429]:
-                        logger.warning(f"🚫 [{response.status_code}] Retry: {url}")
-                        continue
-                    elif response.status_code == 404:
-                        return None
+                extracted_data = {
+                    "id": post_container.get("id"),
+                    "title": post_container.get("title"),
+                    "selftext": post_container.get("selftext"),
+                    "author": post_container.get("author"),
+                    "ups": post_container.get("ups"),
+                    "upvote_ratio": post_container.get("upvote_ratio"),
+                    "created_utc": post_container.get("created_utc"),
+                    "comments": comments_data
+                }
             
-            except Exception as e:
-                logger.error(f"❌ Error {url}: {str(e)[:50]}")
-                await asyncio.sleep(1)
+            # 列表页结构
+            elif isinstance(data, dict):
+                children = data.get("data", {}).get("children", [])
+                extracted_data = {
+                    "type": "listing",
+                    "posts": [{
+                        "id": c['data'].get('id'),
+                        "title": c['data'].get('title'),
+                        "url": c['data'].get('url'),
+                        "permalink": c['data'].get('permalink')
+                    } for c in children if c.get('kind') == 't3'] # t3 是帖子
+                }
+
+            return {
+                "url": original_url,
+                "platform": "reddit",
+                "type": content_type,
+                "parsed": extracted_data,
+                "raw_json": data, 
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {"url": original_url, "error": f"Parse Error: {str(e)}", "raw_partial": str(data)[:100]}
+
+class TikTokHandler:
+    @staticmethod
+    def extract_data(html: str, url: str) -> Optional[Dict]:
+        # 针对 TikTok 的通用提取，保持不变
+        patterns = [
+            r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">([^<]+)</script>',
+            r'<script id="SIGI_STATE" type="application/json">([^<]+)</script>'
+        ]
         
+        for p in patterns:
+            match = re.search(p, html)
+            if match:
+                try:
+                    raw_data = json.loads(match.group(1))
+                    return {
+                        "url": url,
+                        "platform": "tiktok",
+                        "type": "video_meta",
+                        "raw_data": raw_data,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                except:
+                    continue
         return None
 
-class CrawlerManager:
-    def __init__(self, start_urls: List[str]):
-        self.start_urls = start_urls
-        self.queue = asyncio.Queue()
-        self.seen_urls = set()
-        self.scraper = StealthScraper(ProxyManager(PROXY_LIST))
+# ================= 3. 存储层 (保持简洁) =================
+class StorageBackend(ABC):
+    @abstractmethod
+    async def initialize(self): pass
+    @abstractmethod
+    async def save_data(self, record: Dict): pass
+    @abstractmethod
+    async def close(self): pass
 
-    def _generate_pagination(self, base_url: str, total_pages: int) -> List[str]:
-        parsed = urlparse(base_url)
-        qs = parse_qs(parsed.query)
-        qs.pop('page', None)
-        links = []
-        for p in range(2, total_pages + 1):
-            qs['page'] = [str(p)]
-            new_query = urlencode(qs, doseq=True)
-            new_url = urlunparse(parsed._replace(query=new_query))
-            links.append(new_url)
-        return links
+class LocalStorage(StorageBackend):
+    def __init__(self, base_dir: str):
+        self.base_dir = base_dir
+        self.data_file = os.path.join(base_dir, "scraped_data.jsonl")
+        self._file_handle = None
+
+    async def initialize(self):
+        os.makedirs(self.base_dir, exist_ok=True)
+        self._file_handle = await aiofiles.open(self.data_file, mode='a', encoding='utf-8', buffering=1)
+
+    async def save_data(self, record: Dict):
+        if self._file_handle:
+            await self._file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    async def close(self):
+        if self._file_handle: await self._file_handle.close()
+
+# S3 实现略去以节省篇幅，逻辑同上文...
+
+# ================= 4. 任务管理器 =================
+class TaskManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._db = None
+        self._lock = asyncio.Lock()
+
+    async def init_db(self):
+        self._db = await aiosqlite.connect(self.db_path)
+        await self._db.execute("PRAGMA journal_mode=WAL;")
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                url TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'PENDING',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self._db.commit()
+
+    async def add_tasks(self, urls: List[str]):
+        if not urls: return
+        async with self._lock:
+            await self._db.executemany(
+                "INSERT OR IGNORE INTO tasks (url) VALUES (?)", [(u,) for u in urls]
+            )
+            await self._db.commit()
+
+    async def acquire_task(self) -> Optional[Tuple[str, int]]:
+        # 优先重试次数少的老任务
+        q = """
+            UPDATE tasks
+            SET status = 'PROCESSING', updated_at = CURRENT_TIMESTAMP
+            WHERE url = (
+                SELECT url FROM tasks 
+                WHERE status = 'PENDING' 
+                OR (status = 'FAILED' AND retry_count < ?)
+                ORDER BY retry_count ASC, updated_at ASC
+                LIMIT 1
+            )
+            RETURNING url, retry_count
+        """
+        async with self._lock:
+            try:
+                async with self._db.execute(q, (CONFIG.MAX_RETRIES,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row: await self._db.commit()
+                    return row
+            except Exception as e:
+                logger.error(f"DB Error: {e}")
+        return None
+
+    async def update_task(self, url: str, status: str, error_msg: str = None):
+        async with self._lock:
+            if status == 'FAILED':
+                await self._db.execute(
+                    "UPDATE tasks SET status=?, retry_count=retry_count+1, last_error=? WHERE url=?", 
+                    (status, error_msg, url)
+                )
+            else:
+                await self._db.execute("UPDATE tasks SET status=?, last_error=NULL WHERE url=?", (status, url))
+            await self._db.commit()
+    
+    async def close(self):
+        if self._db: await self._db.close()
+
+# ================= 5. 网络引擎 (核心修复区) =================
+class NetworkEngine:
+    def __init__(self, storage: StorageBackend):
+        self.storage = storage
+        # ⚠️ 只使用 Chrome 指纹，因为 Reddit 对 Chrome 支持最好
+        self.impersonates = ["chrome110", "chrome120", "chrome124"]
+
+    def _get_random_proxy(self) -> Optional[str]:
+        if not CONFIG.PROXY_LIST:
+            return None
+        return random.choice(CONFIG.PROXY_LIST)
+
+    async def fetch_and_process(self, url: str) -> Literal["SUCCESS", "RETRY", "FATAL", "SKIP"]:
+        """
+        核心抓取逻辑
+        """
+        proxy = self._get_random_proxy()
+        proxies = {"http": proxy, "https": proxy} if proxy else {}
+        
+        target_url = url
+        is_reddit = "reddit.com" in url
+        is_tiktok = "tiktok.com" in url
+
+        # 1. 针对 Reddit 的 URL 预处理 (强制 old.reddit.com)
+        if is_reddit:
+            target_url = RedditHandler.optimize_url(url)
+        
+        # 2. 构造 Headers
+        # 注意：使用 curl_cffi 时，不要随便覆盖 User-Agent，除非你确信不会破坏 TLS 指纹
+        # 这里的策略是：让 impersonate 处理 User-Agent，我们只补充语义 Header
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+        # Reddit 专用 Header (模拟 API 调用意图)
+        if is_reddit:
+            headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+
+        try:
+            # 随机延迟，避免并发过高触发风控
+            await asyncio.sleep(random.uniform(2.0, 5.0))
+            
+            chosen_impersonate = random.choice(self.impersonates)
+            
+            logger.debug(f"🔍 Requesting: {target_url} | Impersonate: {chosen_impersonate}")
+            
+            async with AsyncSession(
+                impersonate=chosen_impersonate,
+                proxies=proxies,
+                headers=headers,
+                timeout=CONFIG.REQUEST_TIMEOUT,
+                verify=False # 忽略 SSL 验证有时能绕过某些弱防火墙
+            ) as s:
+                response = await s.get(target_url)
+                
+                # --- 状态码处理 ---
+                if response.status_code == 404:
+                    logger.warning(f"⛔️ 404 Not Found: {target_url}")
+                    return "FATAL" # 无需重试
+
+                if response.status_code in [403, 429]:
+                    logger.warning(f"🛡️ 403/429 Blocked ({target_url}) - Suggestion: Rotate Proxy")
+                    return "RETRY"
+
+                if response.status_code != 200:
+                    logger.warning(f"⚠️ HTTP {response.status_code}")
+                    return "RETRY"
+
+                # --- Reddit 数据处理 ---
+                if is_reddit:
+                    try:
+                        # 检查内容是否真的是 JSON
+                        if "application/json" not in response.headers.get("content-type", ""):
+                            # 即使是 200，如果返回 HTML 也是被盾了
+                            # 很多时候 Reddit 200 返回一个 HTML 让你“Verify your email”
+                            logger.error(f"❌ Reddit returned HTML instead of JSON (Soft Block): {target_url}")
+                            return "RETRY"
+
+                        json_data = response.json()
+                        parsed = RedditHandler.parse_response(json_data, url)
+                        await self.storage.save_data(parsed)
+                        logger.info(f"✅ Reddit Success: {url}")
+                        return "SUCCESS"
+                    except json.JSONDecodeError:
+                        logger.error("❌ JSON Decode Error")
+                        return "RETRY"
+
+                # --- TikTok 数据处理 ---
+                if is_tiktok:
+                    tiktok_data = TikTokHandler.extract_data(response.text, url)
+                    if tiktok_data:
+                        await self.storage.save_data(tiktok_data)
+                        logger.info(f"✅ TikTok Success: {url}")
+                        return "SUCCESS"
+                    else:
+                        logger.warning(f"⚠️ TikTok Meta Not Found: {url}")
+                        # 失败后可以尝试保存 HTML 以后分析
+                        return "RETRY"
+
+                # --- 默认 HTML 处理 ---
+                # ... (通用处理逻辑)
+                
+                return "SUCCESS"
+
+        except RequestsError as e:
+            logger.error(f"❌ Network Error: {e}")
+            return "RETRY"
+        except Exception as e:
+            logger.error(f"❌ Unexpected Error: {e}")
+            return "RETRY"
+
+# ================= 6. 主程序 =================
+class CrawlerEngine:
+    def __init__(self):
+        if CONFIG.STORAGE_TYPE == "local":
+            self.storage = LocalStorage(CONFIG.DATA_DIR)
+        else:
+            # S3 初始化逻辑
+            pass
+            
+        self.db = TaskManager(os.path.join(CONFIG.DATA_DIR, CONFIG.DB_NAME))
+        self.network = NetworkEngine(self.storage)
+        self.shutdown_event = asyncio.Event()
 
     async def worker(self, worker_id: int):
-        async with aiofiles.open(OUTPUT_FILE, mode='a', encoding='utf-8') as f:
-            while True:
-                try:
-                    url = await asyncio.wait_for(self.queue.get(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    if self.queue.empty(): break
+        logger.info(f"👷 Worker-{worker_id} started")
+        while not self.shutdown_event.is_set():
+            try:
+                task = await self.db.acquire_task()
+                if not task:
+                    await asyncio.sleep(2)
                     continue
+                
+                url, retry_cnt = task
+                
+                # 指数退避策略：失败次数越多，等待越久
+                if retry_cnt > 0:
+                    delay = min(30, 2 ** retry_cnt)
+                    logger.info(f"⏳ Backoff {delay}s for retry {retry_cnt}: {url}")
+                    await asyncio.sleep(delay)
 
-                if url in self.seen_urls:
-                    self.queue.task_done()
-                    continue
-                self.seen_urls.add(url)
+                logger.info(f"▶️ Processing: {url}")
+                status = await self.network.fetch_and_process(url)
+                
+                if status == "SUCCESS":
+                    await self.db.update_task(url, "COMPLETED")
+                elif status == "FATAL":
+                    await self.db.update_task(url, "FAILED_FATAL", error_msg="404 or Logic Error")
+                elif status == "RETRY":
+                    await self.db.update_task(url, "FAILED", error_msg="Network/Auth Error")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker Exception: {e}")
+                await asyncio.sleep(1)
 
-                logger.info(f"👷 [Worker-{worker_id}] 任务: {url}")
-                data = await self.scraper.fetch_and_process(url)
+    async def run(self, seeds: List[str]):
+        await self.db.init_db()
+        await self.db.add_tasks(seeds)
+        await self.storage.initialize()
+        
+        workers = [asyncio.create_task(self.worker(i)) for i in range(CONFIG.MAX_CONCURRENCY)]
+        
+        # 优雅退出逻辑
+        def signal_handler():
+            self.shutdown_event.set()
+            logger.info("🛑 Stopping...")
 
-                if data:
-                    # 构建保存记录
-                    save_data = {
-                        "url": data["url"],
-                        "type": data["type"],
-                        "timestamp": asyncio.get_event_loop().time()
-                    }
-
-                    # 根据返回类型分别处理
-                    if data["type"] == "file":
-                        save_data["local_path"] = data["file_path"]
-                        save_data["content_type"] = data["content_type"]
-                        save_data["file_size"] = data["size_bytes"]
-                    
-                    elif data["type"] == "review_platform":
-                        save_data["title"] = data["title"]
-                        save_data["reviews"] = data["reviews"]
-                        # 处理 Trustpilot 翻页
-                        if data.get("total_pages", 0) > 1 and ("page=" not in url or "page=1" in url):
-                            logger.info(f"✨ 发现 {data['total_pages']} 页，生成任务...")
-                            new_links = self._generate_pagination(url, data["total_pages"])
-                            for link in new_links:
-                                if link not in self.seen_urls: await self.queue.put(link)
-                    
-                    else: # generic article
-                        save_data["title"] = data["title"]
-                        save_data["content"] = data["content"]
-
-                    await f.write(json.dumps(save_data, ensure_ascii=False) + "\n")
-
-                self.queue.task_done()
-
-    async def run(self):
-        for url in self.start_urls: await self.queue.put(url)
-        workers = [asyncio.create_task(self.worker(i)) for i in range(MAX_CONCURRENCY)]
-        await self.queue.join()
-        for w in workers: w.cancel()
-        logger.info(f"🎉 全部完成。数据已保存至 {OUTPUT_FILE}，文件已保存至 {DOWNLOAD_DIR}/")
+        loop = asyncio.get_running_loop()
+        if sys.platform != "win32":
+            loop.add_signal_handler(signal.SIGINT, signal_handler)
+        
+        try:
+            # 简单的主循环监控
+            while not self.shutdown_event.is_set():
+                if all(w.done() for w in workers):
+                    break
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            signal_handler()
+        finally:
+            self.shutdown_event.set()
+            await asyncio.gather(*workers, return_exceptions=True)
+            await self.db.close()
+            await self.storage.close()
 
 if __name__ == "__main__":
-    targets  = ["https://ascpd.org.au/wp-content/uploads/ASCD-Journal-Edition-10-Cosmeceuticals.pdf"]
+    # 混合测试种子
+    targets = [
+       "https://www.reddit.com/r/DIYfragrance/comments/1oj09hp/recommendations_for_incense_fragrance",
+    "https://www.reddit.com/r/fragrance/comments/1jdl45d/does_anybody_else_find_frankincense_to_be_a_sexy",
+    "https://www.reddit.com/r/DIYfragrance/comments/1klxda6/top_5_raw_ingredients",
+    "https://www.reddit.com/r/DIYfragrance/comments/1nuewt8/best_natural_essential_oil_combos_for_masculine",
+    "https://www.reddit.com/r/Incense/comments/1k9xbr4/cultural_historical_and_ceremonial_uses_of",
+    "https://www.reddit.com/r/AsianBeauty/comments/1ojacpn/different_ingredients_in_us_vs_korea_skin_1004",
+    "https://www.reddit.com/r/DIYfragrance/comments/1lkyv5s/incense_accord",
+    "https://www.reddit.com/r/SkincareAddiction/comments/1q02upp/antiaging_is_anyone_familiar_with_this_brand",
+    "https://www.reddit.com/r/SkincareAddiction/comments/1oy5he8/antiaging_best_look_younger_single_step_product",
+    "https://www.reddit.com/r/AsianBeauty/comments/1poki78/antiaging_high_end_product_recommendations",
+    "https://www.reddit.com/r/AskMenOver30/comments/1oa0qu8/has_anyone_actually_noticed_results_from",
+    "https://www.reddit.com/r/SkincareAddictionLux/comments/1otf69z/favorite_antiaging_face_oil_with_antioxidants",
+    "https://www.reddit.com/r/Sephora/comments/1l5fjtb/what_antiaging_products_visably_made_such_a", 
+        # TikTok 种子
+        "https://www.tiktok.com/@tiktok/video/7306352936746208544",
+    ]
+    
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-
-    try:
-        import sys
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except ImportError:
-        pass
-
-    crawler = CrawlerManager(targets)
-    asyncio.run(crawler.run())
+    engine = CrawlerEngine()
+    asyncio.run(engine.run(targets))
